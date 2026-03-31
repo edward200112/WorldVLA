@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "language-waypoint-planner"
+version = "0.1.0"
+description = "Research-grade prototype for language-enhanced waypoint planning."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "torch>=2.0",
+  "torchvision>=0.15",
+  "numpy>=1.24",
+  "Pillow>=9.0",
+]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.36"]
+config = ["PyYAML>=6.0"]
+logging = ["tensorboard>=2.12"]
+
+[tool.setuptools.packages.find]
+include = ["language_waypoint_planner*"]

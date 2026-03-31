@@ -1,0 +1,92 @@
+{
+  "experiment_name": "multitask_vla",
+  "data": {
+    "batch_size": 4,
+    "num_workers": 0,
+    "shuffle": true,
+    "train_sources": [
+      {
+        "name": "waymo",
+        "use_synthetic": true,
+        "synthetic_length": 32,
+        "image_size": [96, 96],
+        "temporal_window": 4,
+        "future_steps": 20,
+        "history_steps": 16
+      },
+      {
+        "name": "drivelm",
+        "use_synthetic": true,
+        "synthetic_length": 24,
+        "image_size": [96, 96],
+        "temporal_window": 4,
+        "future_steps": 20,
+        "history_steps": 16
+      },
+      {
+        "name": "talk2car",
+        "use_synthetic": true,
+        "synthetic_length": 24,
+        "image_size": [96, 96],
+        "temporal_window": 4,
+        "future_steps": 20,
+        "history_steps": 16
+      }
+    ],
+    "val_sources": [
+      {
+        "name": "waymo",
+        "use_synthetic": true,
+        "synthetic_length": 8,
+        "image_size": [96, 96],
+        "temporal_window": 4,
+        "future_steps": 20,
+        "history_steps": 16
+      }
+    ]
+  },
+  "model": {
+    "vision_encoder_type": "lite_vit",
+    "vision_hidden_dim": 128,
+    "ego_encoder_type": "transformer",
+    "text_backend": "hash",
+    "text_vocab_size": 2048,
+    "text_max_length": 24,
+    "rationale_vocab_size": 2048,
+    "rationale_max_length": 16,
+    "fusion_dim": 128,
+    "fusion_heads": 4,
+    "fusion_layers": 3,
+    "dropout": 0.1,
+    "max_fusion_tokens": 128,
+    "lite_vit_patch_size": 16
+  },
+  "losses": {
+    "waypoint_weight": 1.0,
+    "behavior_weight": 0.7,
+    "rationale_weight": 0.5,
+    "smoothness_weight": 0.1,
+    "preference_weight": 0.0,
+    "waypoint_final_step_weight": 2.5
+  },
+  "logging": {
+    "use_tensorboard": false,
+    "log_every_n_steps": 5,
+    "output_dir": "outputs",
+    "run_name": "multitask_vla"
+  },
+  "evaluation": {
+    "save_visualizations": true,
+    "num_visualizations": 4,
+    "eval_every_n_epochs": 1
+  },
+  "training": {
+    "seed": 11,
+    "epochs": 2,
+    "learning_rate": 0.0005,
+    "weight_decay": 0.0001,
+    "grad_clip_norm": 1.0,
+    "use_amp": false,
+    "device": "cpu"
+  }
+}
