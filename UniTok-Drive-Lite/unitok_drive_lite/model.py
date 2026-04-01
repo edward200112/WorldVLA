@@ -95,6 +95,9 @@ class UnifiedDriveModel(nn.Module):
         self.config = config
         self.compute_dtype = resolve_torch_dtype(config.model.torch_dtype)
         self.processor = AutoProcessor.from_pretrained(config.model.model_name)
+        # Emu3 官方建议 batched generation 时使用 left padding，
+        # 这是最小兼容设置，不影响训练逻辑（训练时 batch_size=1 逐条前向）。
+        self.processor.tokenizer.padding_side = "left"
         self.tokenizer = self.processor.tokenizer
         self.token_registry = TokenRegistry.from_token_config(config.tokens)
         if self.tokenizer.pad_token_id is None:
