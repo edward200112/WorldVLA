@@ -28,7 +28,7 @@ from unitok_drive_lite.train_utils import (
 
 def parse_args() -> argparse.Namespace:
     """解析最小训练脚本参数。"""
-    parser = argparse.ArgumentParser(description="训练最小版 UniTok-Drive-Lite。")
+    parser = argparse.ArgumentParser(description="训练最小版 UniTok-Drive-Lite Emu3 主干。")
     parser.add_argument("--dataset_size", type=int, default=8)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--output_dir", type=str, default="outputs/unitok_drive_lite")
@@ -48,6 +48,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = UnifiedDriveModel(config).to(device)
+    print(f"[model] backbone={config.model.model_name}")
     total_parameters, trainable_parameters = model.count_trainable_parameters()
     print(f"[model] total_parameters={total_parameters:,}")
     print(f"[model] trainable_parameters={trainable_parameters:,}")

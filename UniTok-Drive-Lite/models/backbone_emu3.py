@@ -1,63 +1,51 @@
 from __future__ import annotations
 
-"""Deprecated: 历史 Chameleon backbone 封装。
+"""Emu3 主干加载与前向辅助工具。
 
-仓库主干已迁移到 Emu3，新代码应优先使用 `models/backbone_emu3.py`。
-此文件仅保留给旧实验链路做对照参考，不再建议接入新的训练或推理入口。
+设计说明：
+- Emu3 的多模态输入需要同时满足两件事：
+  1. 文本 prompt 中保留 `<image>` 占位；
+  2. 实际图像必须交给 `Emu3Processor` 处理成 `pixel_values` / `image_sizes`。
+- 因此不能简单复用 Chameleon 时代那种“只靠手工拼 token id”的做法。
+  对 Emu3 而言，图像占位 token 与视觉张量的对齐由 processor 负责，少了任一侧都不完整。
 """
 
+import warnings
 from typing import Any, Mapping, Sequence
 
 import torch
 from torch import nn
 
+from .attention_mask import infer_padding_mask_from_additive_attention_mask
+from unitok_drive_lite.token_registry import DEFAULT_DRIVE_SPECIAL_TOKENS
+
 try:
     from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-    from transformers import (
-        BitsAndBytesConfig,
-        ChameleonForConditionalGeneration,
-        ChameleonProcessor,
-    )
+    from transformers import BitsAndBytesConfig, Emu3ForConditionalGeneration, Emu3Processor
 except ImportError:
     BitsAndBytesConfig = None
-    ChameleonForConditionalGeneration = None
-    ChameleonProcessor = None
+    Emu3ForConditionalGeneration = None
+    Emu3Processor = None
     LoraConfig = None
     TaskType = None
     get_peft_model = None
     prepare_model_for_kbit_training = None
 
 
-DEFAULT_DRIVE_SPECIAL_TOKENS: tuple[str, ...] = (
-    "<BEV>",
-    "<ACT>",
-    "<PLAN>",
-    "<DREAM>",
-    "<ACT_SUMMARY>",
-    "<NAV_LEFT>",
-    "<NAV_RIGHT>",
-    "<NAV_STRAIGHT>",
-    "<LIGHT_RED>",
-    "<LIGHT_GREEN>",
-    "<RISK_PED>",
-    "<RISK_VEH>",
-    "<RISK_OCC>",
-)
-
 
 def _require_dependencies() -> None:
-    """检查 Transformers 和 PEFT 依赖是否已安装。"""
+    """检查 Emu3 依赖是否已安装。"""
     if (
         BitsAndBytesConfig is None
-        or ChameleonForConditionalGeneration is None
-        or ChameleonProcessor is None
+        or Emu3ForConditionalGeneration is None
+        or Emu3Processor is None
         or LoraConfig is None
         or TaskType is None
         or get_peft_model is None
         or prepare_model_for_kbit_training is None
     ):
         raise ImportError(
-            "请先安装 transformers、peft、accelerate、bitsandbytes，再使用 Chameleon backbone。"
+            "请先安装 transformers、peft、accelerate、bitsandbytes，并确保当前 transformers 版本包含 Emu3。"
         )
 
 
@@ -93,7 +81,7 @@ def _find_first_floating_dtype(model: nn.Module) -> torch.dtype:
 
 
 def _deduplicate_tokens(tokens: Sequence[str]) -> list[str]:
-    """去重并保持 special token 的原始顺序。"""
+    """去重并保持 special token 原始顺序。"""
     return list(dict.fromkeys(tokens))
 
 
@@ -104,10 +92,7 @@ def _freeze_all_parameters(model: nn.Module) -> None:
 
 
 def _collect_embedding_like_parameters(model: nn.Module) -> list[torch.nn.Parameter]:
-    """收集输入 embedding 和输出 lm_head 对应的权重参数。
-
-    这里优先通过官方接口获取，如果遇到 PEFT 包装，再回退到名称匹配。
-    """
+    """收集输入 embedding 和输出 lm_head 对应的权重参数。"""
     collected_parameters: list[torch.nn.Parameter] = []
     visited_parameter_ids: set[int] = set()
 
@@ -123,11 +108,10 @@ def _collect_embedding_like_parameters(model: nn.Module) -> list[torch.nn.Parame
             collected_parameters.append(weight)
             visited_parameter_ids.add(id(weight))
 
-    name_patterns = ("embed_tokens", "lm_head")
     for name, parameter in model.named_parameters():
         if not name.endswith("weight"):
             continue
-        if any(pattern in name for pattern in name_patterns):
+        if "embed_tokens" in name or "lm_head" in name:
             if id(parameter) not in visited_parameter_ids:
                 collected_parameters.append(parameter)
                 visited_parameter_ids.add(id(parameter))
@@ -135,13 +119,7 @@ def _collect_embedding_like_parameters(model: nn.Module) -> list[torch.nn.Parame
 
 
 def _enable_only_new_token_rows(model: nn.Module, trainable_token_start: int) -> None:
-    """只让新增 token 对应的 embedding 行参与训练。
-
-    说明：
-    - PyTorch 不能直接对同一个 Parameter 的部分行设置 `requires_grad`
-    - 因此这里通过 gradient hook 把旧词表行的梯度清零
-    - 这样最终只有新增 token 的 embedding / lm_head 行会被更新
-    """
+    """只让新增 token 对应的 embedding 行参与训练。"""
     old_handles = getattr(model, "_new_token_gradient_hook_handles", None)
     if old_handles is not None:
         for handle in old_handles:
@@ -173,15 +151,11 @@ def add_special_tokens(
     processor: Any,
     special_tokens: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """向 processor tokenizer 与模型词表中添加自动驾驶 special tokens。
+    """向 Emu3 tokenizer 与模型词表中添加自动驾驶 special tokens。
 
-    参数：
-    - model: 已加载的 Chameleon 模型，也可以为 None；如果为 None，则只改 tokenizer
-    - processor: ChameleonProcessor
-    - special_tokens: 要添加的 special token 列表；默认使用内置自动驾驶 token
-
-    返回：
-    - 一个字典，包含新增 token 数量、词表大小变化与 token-id 映射
+    说明：
+    - Emu3 的图像占位 token 不需要这里手动添加，processor 会使用模型内置视觉占位机制。
+    - 这里仅扩充自动驾驶领域自定义 token，例如 `<ACT>`、`<BEV>` 等。
     """
     _require_dependencies()
 
@@ -208,13 +182,15 @@ def add_special_tokens(
 
     if model is not None:
         previous_start = getattr(model, "_trainable_token_start", old_vocab_size)
-        trainable_token_start = min(previous_start, old_vocab_size) if new_vocab_size > old_vocab_size else previous_start
+        if new_vocab_size > old_vocab_size:
+            trainable_token_start = min(previous_start, old_vocab_size)
+        else:
+            trainable_token_start = previous_start
 
         model._special_token_info = token_info
         model._special_token_ids = token_to_id
         model._trainable_token_start = trainable_token_start
 
-        # 如果此时模型已经完成 LoRA 包装，这一步会重新挂上“仅训练新增 token 行”的梯度掩码。
         if trainable_token_start < new_vocab_size:
             _enable_only_new_token_rows(model, trainable_token_start)
 
@@ -222,7 +198,7 @@ def add_special_tokens(
 
 
 def build_model_and_processor(
-    model_name: str = "facebook/chameleon-7b",
+    model_name: str = "BAAI/Emu3-Chat-hf",
     load_in_4bit: bool = True,
     torch_dtype: str | torch.dtype = torch.bfloat16,
     device_map: str | dict[str, Any] | None = "auto",
@@ -237,26 +213,22 @@ def build_model_and_processor(
     gradient_checkpointing: bool = False,
     token: str | None = None,
 ) -> tuple[nn.Module, Any]:
-    """构建 Chameleon 主干模型和对应 processor。
+    """构建 Emu3 主干模型和对应 processor。
 
     关键配置说明：
-    - `load_in_4bit=True`:
-      使用 bitsandbytes 的 4-bit 量化加载底模，适合 QLoRA 式微调，显著节省显存。
-    - `attn_implementation="eager"`:
-      默认使用 eager attention，便于后续传入自定义 4D selective attention mask。
-    - `use_lora=True`:
-      默认只训练 LoRA 适配器；底模参数保持冻结。
-    - `add_drive_special_tokens=True`:
-      默认会把自动驾驶统一 token 中常用的 special tokens 预留进词表。
-    - “只训练新增 token embedding” 的实现方式：
-      这里通过梯度掩码只更新新词表行，而不是更新整个 embedding 矩阵。
+    - `model_name` 默认使用 `BAAI/Emu3-Chat-hf`，这是文本生成和图文理解更合适的 checkpoint。
+    - `processor.apply_chat_template(...)` 应优先用于构建对话 prompt，因为 Emu3 训练时依赖固定聊天格式。
+    - 图像输入不能只手工拼接 `<image>` token；还必须把真实图像交给 `processor(images=..., text=...)`
+      或 `processor.image_processor(...)` 生成视觉张量，再与文本 prompt 一起送入模型。
+    - `load_in_4bit=True` 可用于低显存 LoRA 微调。
+    - `use_lora=True` 时默认冻结底模，仅训练 LoRA 和新增 token 对应的 embedding 行。
     """
     _require_dependencies()
 
     resolved_dtype = _resolve_torch_dtype(torch_dtype)
-    processor = ChameleonProcessor.from_pretrained(model_name, token=token)
+    processor = Emu3Processor.from_pretrained(model_name, token=token)
+    processor.tokenizer.padding_side = "left"
 
-    quantization_config = None
     pretrained_kwargs: dict[str, Any] = {
         "attn_implementation": attn_implementation,
         "device_map": device_map,
@@ -264,17 +236,16 @@ def build_model_and_processor(
     }
 
     if load_in_4bit:
-        quantization_config = BitsAndBytesConfig(
+        pretrained_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=resolved_dtype,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
         )
-        pretrained_kwargs["quantization_config"] = quantization_config
     else:
         pretrained_kwargs["torch_dtype"] = resolved_dtype
 
-    model = ChameleonForConditionalGeneration.from_pretrained(model_name, **pretrained_kwargs)
+    model = Emu3ForConditionalGeneration.from_pretrained(model_name, **pretrained_kwargs)
 
     special_token_info: dict[str, Any] | None = None
     if add_drive_special_tokens:
@@ -309,8 +280,6 @@ def build_model_and_processor(
     else:
         _freeze_all_parameters(model)
 
-    # LoRA 包装后重新恢复“新增 token 行可训练”的能力。
-    trainable_token_start = None
     if special_token_info is not None:
         trainable_token_start = special_token_info["old_vocab_size"]
         model._special_token_info = special_token_info
@@ -326,12 +295,50 @@ def forward_batch(
     batch: Mapping[str, Any],
     **forward_kwargs: Any,
 ) -> Any:
-    """执行一次前向传播，但不包含训练逻辑。
+    """执行一次 Emu3 前向传播，但不包含训练逻辑。
 
-    用法约定：
-    - `batch` 通常来自 `processor(..., return_tensors="pt")`
-    - 也可以来自你自己的 collator，只要字段名符合 Hugging Face 模型 forward 接口
-    - 如果 batch 中包含 `pixel_values`，会自动转换到模型的主要浮点 dtype
+    约定：
+    - 如果 `batch` 里已经包含 `pixel_values` / `image_sizes`，函数会自动搬运到模型设备。
+    - 如果上层已经自己构造好了多模态 batch，本函数不改其字段结构，只做 dtype / device 适配。
+    - 训练或 planner 的“全序列 query 打分”场景可以传 4D additive mask。
+    - `generation_attention_mask` 是给 `generate(...)` 准备的旁路字段，这里会主动忽略。
+    """
+    target_device = _find_first_parameter_device(model)
+    target_dtype = _find_first_floating_dtype(model)
+
+    prepared_batch: dict[str, Any] = {}
+    for key, value in batch.items():
+        if key == "generation_attention_mask":
+            continue
+        if torch.is_tensor(value):
+            tensor = value
+            if tensor.device != target_device:
+                if tensor.is_floating_point() and key == "pixel_values":
+                    tensor = tensor.to(device=target_device, dtype=target_dtype)
+                else:
+                    tensor = tensor.to(device=target_device)
+            elif tensor.is_floating_point() and key == "pixel_values":
+                tensor = tensor.to(dtype=target_dtype)
+            prepared_batch[key] = tensor
+        else:
+            prepared_batch[key] = value
+
+    prepared_batch.update(forward_kwargs)
+    return model(**prepared_batch)
+
+
+def generate(
+    model: nn.Module,
+    batch: Mapping[str, Any],
+    **generate_kwargs: Any,
+) -> torch.Tensor:
+    """执行 Emu3 的 generate，并自动处理设备与 dtype。
+
+    说明：
+    - Transformers 的 `generate(...)` 路径通常更稳定地支持 2D padding mask，而不是自定义 4D additive mask。
+    - 如果上层误传了 4D selective mask，这里会自动退化为 2D padding mask。
+      这种退化只保留“非 PAD 有效位”，不会保留 future action 互不可见的细粒度约束。
+    - 因此严格的 selective action 推理，优先使用 `forward_batch(...)` 手工逐步解码或 query 打分。
     """
     target_device = _find_first_parameter_device(model)
     target_dtype = _find_first_floating_dtype(model)
@@ -351,5 +358,18 @@ def forward_batch(
         else:
             prepared_batch[key] = value
 
-    prepared_batch.update(forward_kwargs)
-    return model(**prepared_batch)
+    generation_attention_mask = prepared_batch.pop("generation_attention_mask", None)
+    attention_mask = prepared_batch.get("attention_mask")
+    if torch.is_tensor(attention_mask) and attention_mask.ndim == 4:
+        warnings.warn(
+            "Emu3 generate 路径收到 4D selective attention mask，已自动回退到 2D padding mask。"
+            "如果需要严格的 future action selective visibility，请改用 forward_batch(...)。",
+            stacklevel=2,
+        )
+        if generation_attention_mask is None:
+            generation_attention_mask = infer_padding_mask_from_additive_attention_mask(attention_mask)
+        prepared_batch["attention_mask"] = generation_attention_mask.to(device=target_device)
+    elif generation_attention_mask is not None and "attention_mask" not in prepared_batch:
+        prepared_batch["attention_mask"] = generation_attention_mask.to(device=target_device)
+
+    return model.generate(**prepared_batch, **generate_kwargs)

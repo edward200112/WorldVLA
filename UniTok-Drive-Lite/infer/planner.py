@@ -17,8 +17,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.action_tokenizer import ActionTokenizer
-from models.attention_mask import TokenType, build_selective_attention_mask
-from models.backbone_chameleon import DEFAULT_DRIVE_SPECIAL_TOKENS, forward_batch
+from models.attention_mask import TokenType, build_generation_attention_mask, build_selective_attention_mask
+from models.backbone_emu3 import forward_batch
+from unitok_drive_lite.token_registry import TokenRegistry
 
 
 @dataclass
@@ -34,15 +35,6 @@ class PlannerConfig:
     risk_weight: float = 0.4
     progress_weight: float = 0.4
     comfort_weight: float = 0.2
-
-
-def build_dynamic_token_vocab(prefix: str, vocab_size: int) -> list[str]:
-    """为 action 或 BEV 构造统一 token 字符串。"""
-    if vocab_size <= 1:
-        raise ValueError("vocab_size 必须大于 1。")
-    width = max(4, len(str(vocab_size - 1)))
-    return [f"<{prefix}_{index:0{width}d}>" for index in range(vocab_size)]
-
 
 def _to_numpy_array(value: Any) -> np.ndarray:
     """把 PIL / numpy / torch 输入统一转成 numpy 数组。"""
@@ -102,6 +94,14 @@ def normalize_history_action_tokens(
     return normalized_tokens
 
 
+def build_token_registry(action_tokenizer: ActionTokenizer, bev_codebook_size: int) -> TokenRegistry:
+    """根据 action tokenizer 和 BEV 词表大小构造全局固定 token registry。"""
+    return TokenRegistry.from_vocab_sizes(
+        action_vocab_size=action_tokenizer.codebook_size,
+        bev_vocab_size=bev_codebook_size,
+    )
+
+
 def tokenizer_special_id(tokenizer: Any, token: str) -> int:
     """把 special token 映射成 token id。"""
     token_id = tokenizer.convert_tokens_to_ids(token)
@@ -159,119 +159,222 @@ def _get_model_device(model: nn.Module) -> torch.device:
     return torch.device("cpu")
 
 
-def _build_action_query_sequence(
-    tokenizer: Any,
+def _resolve_image_placeholder_id(processor: Any) -> int:
+    """解析 Emu3 prompt 中图像占位 token 的 id。"""
+    tokenizer = processor.tokenizer
+    candidate_tokens: list[str] = []
+    for token_name in ("image_token", "boi_token"):
+        value = getattr(tokenizer, token_name, None)
+        if isinstance(value, str):
+            candidate_tokens.append(value)
+    for token_name in ("image_token",):
+        value = getattr(processor, token_name, None)
+        if isinstance(value, str):
+            candidate_tokens.append(value)
+    candidate_tokens.extend(["<image>", "<|image|>", "<|extra_0|>"])
+
+    seen: set[str] = set()
+    for token in candidate_tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        unk_token_id = getattr(tokenizer, "unk_token_id", None)
+        if token_id is not None and (unk_token_id is None or token_id != unk_token_id):
+            return int(token_id)
+    raise ValueError("无法解析 Emu3 的图像占位 token id。")
+
+
+def _build_structured_planner_prompt(
+    processor: Any,
     navigation_text: str,
     history_action_token_strings: Sequence[str],
+    stage_tag: str,
+) -> str:
+    """构造适配 Emu3 chat template 的结构化 prompt。"""
+    summary_tokens = ["<ACT_SUMMARY>"] + list(history_action_token_strings)
+    summary_text = " ".join(summary_tokens) if len(summary_tokens) > 0 else "<ACT_SUMMARY>"
+    conversation = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "[TASK]\nUNI_DRIVE_PLAN"}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"[NAV]\n{navigation_text.strip()}\n[FRONT]\n"},
+                {"type": "image"},
+                {"type": "text", "text": "\n[BEV_NOW]\n"},
+                {"type": "image"},
+                {"type": "text", "text": f"\n[ACT_SUM]\n{summary_text}\n[STAGE]\n{stage_tag}"},
+            ],
+        },
+    ]
+    if hasattr(processor, "apply_chat_template"):
+        return processor.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    return (
+        "[TASK]\nUNI_DRIVE_PLAN\n"
+        f"[NAV]\n{navigation_text.strip()}\n"
+        "[FRONT]\n<image>\n"
+        "[BEV_NOW]\n<image>\n"
+        f"[ACT_SUM]\n{summary_text}\n"
+        f"[STAGE]\n{stage_tag}\nassistant"
+    )
+
+
+def _encode_multimodal_context(
+    processor: Any,
+    navigation_text: str,
+    front_image: Any,
+    bev_image: Any,
+    history_action_token_strings: Sequence[str],
+    stage_tag: str,
+) -> tuple[list[int], list[int], torch.Tensor, torch.Tensor]:
+    """把当前文本、前视图、当前 BEV 编码成 Emu3 上下文。"""
+    tokenizer = processor.tokenizer
+    front_pil = to_pil_image(front_image)
+    bev_pil = to_pil_image(bev_image)
+    prompt = _build_structured_planner_prompt(
+        processor=processor,
+        navigation_text=navigation_text,
+        history_action_token_strings=history_action_token_strings,
+        stage_tag=stage_tag,
+    )
+
+    if callable(processor):
+        context_inputs = processor(
+            text=[prompt],
+            images=[front_pil, bev_pil],
+            return_tensors="pt",
+        )
+    else:
+        context_inputs = {
+            "input_ids": torch.tensor([tokenizer.encode(prompt, add_special_tokens=False)], dtype=torch.long),
+        }
+        context_inputs.update(processor.image_processor(images=[front_pil, bev_pil], return_tensors="pt"))
+
+    context_input_ids = context_inputs["input_ids"][0].tolist()
+    token_types = [int(TokenType.TEXT)] * len(context_input_ids)
+
+    image_placeholder_id = _resolve_image_placeholder_id(processor)
+    image_positions = [index for index, token_id in enumerate(context_input_ids) if int(token_id) == image_placeholder_id]
+    if len(image_positions) < 2:
+        raise ValueError("planner 上下文中必须至少包含两个图像占位 token。")
+    token_types[image_positions[0]] = int(TokenType.IMAGE)
+    token_types[image_positions[1]] = int(TokenType.CURRENT_BEV)
+
+    summary_token_ids: set[int] = set()
+    for token in ["<ACT_SUMMARY>", *history_action_token_strings]:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        unk_token_id = getattr(tokenizer, "unk_token_id", None)
+        if token_id is not None and (unk_token_id is None or token_id != unk_token_id):
+            summary_token_ids.add(int(token_id))
+    for index, token_id in enumerate(context_input_ids):
+        if int(token_id) in summary_token_ids:
+            token_types[index] = int(TokenType.HISTORY_ACTION_SUMMARY)
+
+    image_sizes = context_inputs.get("image_sizes")
+    if image_sizes is None:
+        image_sizes = torch.tensor(
+            [[front_pil.height, front_pil.width], [bev_pil.height, bev_pil.width]],
+            dtype=torch.long,
+        )
+    return context_input_ids, token_types, context_inputs["pixel_values"], image_sizes
+
+
+def _prepare_model_inputs(
+    input_ids: Sequence[int],
+    token_types: Sequence[int],
+    pixel_values: torch.Tensor,
+    image_sizes: torch.Tensor,
+) -> tuple[dict[str, Any], torch.Tensor]:
+    """把 unified-token 序列和图像张量整理成 Emu3 输入。"""
+    input_tensor = torch.tensor([list(input_ids)], dtype=torch.long)
+    token_type_tensor = torch.tensor(token_types, dtype=torch.long)
+    selective_mask = build_selective_attention_mask(token_type_tensor)
+    generation_attention_mask = build_generation_attention_mask(token_type_tensor)
+
+    model_inputs = {
+        "input_ids": input_tensor,
+        "attention_mask": selective_mask,
+        "generation_attention_mask": generation_attention_mask,
+        "pixel_values": pixel_values,
+        "image_sizes": image_sizes,
+    }
+    return model_inputs, token_type_tensor
+
+
+def _append_text_segment(
+    tokenizer: Any,
+    input_ids: list[int],
+    token_types: list[int],
+    text: str,
+) -> None:
+    """向序列尾部追加结构化文本片段。"""
+    text_ids = build_text_token_ids(tokenizer, text)
+    input_ids.extend(text_ids)
+    token_types.extend([int(TokenType.TEXT)] * len(text_ids))
+
+
+def _append_special_token(
+    tokenizer: Any,
+    input_ids: list[int],
+    token_types: list[int],
+    token: str,
+    token_type: TokenType,
+) -> None:
+    """向序列尾部追加一个 special token。"""
+    input_ids.append(tokenizer_special_id(tokenizer, token))
+    token_types.append(int(token_type))
+
+
+def _build_action_query_sequence(
+    tokenizer: Any,
+    context_input_ids: Sequence[int],
+    context_token_types: Sequence[int],
     num_action_tokens: int,
-) -> tuple[list[int], list[int]]:
-    """构造用于候选动作采样的 unified-token 输入序列。"""
-    input_ids: list[int] = []
-    token_types: list[int] = []
-
-    def append_text(text: str) -> None:
-        """追加普通文本 token。"""
-        ids = build_text_token_ids(tokenizer, text)
-        input_ids.extend(ids)
-        token_types.extend([int(TokenType.TEXT)] * len(ids))
-
-    def append_special(token: str, token_type: TokenType) -> None:
-        """追加单个 special token。"""
-        input_ids.append(tokenizer_special_id(tokenizer, token))
-        token_types.append(int(token_type))
-
-    append_text(navigation_text.strip())
-    append_text("\n前视图:")
-    append_special("<image>", TokenType.IMAGE)
-    append_text("\n当前BEV:")
-    append_special("<image>", TokenType.CURRENT_BEV)
-
-    if len(history_action_token_strings) > 0:
-        append_text("\n历史动作摘要:")
-        append_special("<ACT_SUMMARY>", TokenType.HISTORY_ACTION_SUMMARY)
-        for token in history_action_token_strings:
-            append_special(token, TokenType.HISTORY_ACTION_SUMMARY)
-
-    append_text("\n未来动作候选:")
+) -> tuple[list[int], list[int], list[int]]:
+    """在上下文后追加动作 query placeholder。"""
+    input_ids = list(context_input_ids)
+    token_types = list(context_token_types)
+    _append_text_segment(tokenizer, input_ids, token_types, "\n[FUT_ACT]\n")
     action_query_positions: list[int] = []
     for _ in range(num_action_tokens):
         action_query_positions.append(len(input_ids))
-        append_special("<ACT>", TokenType.FUTURE_ACTION)
-    return input_ids, token_types
+        _append_special_token(tokenizer, input_ids, token_types, "<ACT>", TokenType.FUTURE_ACTION)
+    return input_ids, token_types, action_query_positions
 
 
 def _build_bev_query_sequence(
     tokenizer: Any,
-    navigation_text: str,
-    history_action_token_strings: Sequence[str],
+    context_input_ids: Sequence[int],
+    context_token_types: Sequence[int],
     action_token_strings: Sequence[str],
     future_bev_frames: int,
     num_bev_tokens_per_frame: int,
 ) -> tuple[list[int], list[int], list[int]]:
-    """构造给定动作候选后的 future BEV token 预测序列。"""
-    input_ids: list[int] = []
-    token_types: list[int] = []
-
-    def append_text(text: str) -> None:
-        """追加普通文本 token。"""
-        ids = build_text_token_ids(tokenizer, text)
-        input_ids.extend(ids)
-        token_types.extend([int(TokenType.TEXT)] * len(ids))
-
-    def append_special(token: str, token_type: TokenType) -> None:
-        """追加单个 special token。"""
-        input_ids.append(tokenizer_special_id(tokenizer, token))
-        token_types.append(int(token_type))
-
-    append_text(navigation_text.strip())
-    append_text("\n前视图:")
-    append_special("<image>", TokenType.IMAGE)
-    append_text("\n当前BEV:")
-    append_special("<image>", TokenType.CURRENT_BEV)
-
-    if len(history_action_token_strings) > 0:
-        append_text("\n历史动作摘要:")
-        append_special("<ACT_SUMMARY>", TokenType.HISTORY_ACTION_SUMMARY)
-        for token in history_action_token_strings:
-            append_special(token, TokenType.HISTORY_ACTION_SUMMARY)
-
-    append_text("\n未来动作:")
+    """在上下文和动作候选后追加 future BEV query placeholder。"""
+    input_ids = list(context_input_ids)
+    token_types = list(context_token_types)
+    _append_text_segment(tokenizer, input_ids, token_types, "\n[FUT_ACT]\n")
     for token in action_token_strings:
-        append_special(token, TokenType.FUTURE_ACTION)
+        _append_special_token(tokenizer, input_ids, token_types, token, TokenType.FUTURE_ACTION)
 
-    append_text("\n未来BEV:")
     bev_query_positions: list[int] = []
-    total_bev_tokens = future_bev_frames * num_bev_tokens_per_frame
-    for _ in range(total_bev_tokens):
-        bev_query_positions.append(len(input_ids))
-        append_special("<BEV>", TokenType.FUTURE_BEV)
+    for frame_index in range(future_bev_frames):
+        _append_text_segment(tokenizer, input_ids, token_types, f"\n[FUT_BEV_{frame_index + 1}]\n")
+        for _ in range(num_bev_tokens_per_frame):
+            bev_query_positions.append(len(input_ids))
+            _append_special_token(tokenizer, input_ids, token_types, "<BEV>", TokenType.FUTURE_BEV)
     return input_ids, token_types, bev_query_positions
 
 
-def _prepare_model_inputs(
-    processor: Any,
-    input_ids: Sequence[int],
-    token_types: Sequence[int],
-    front_image: Any,
-    bev_image: Any,
-) -> tuple[dict[str, Any], torch.Tensor]:
-    """把 unified-token 序列和两张图像整理成模型输入。"""
-    input_tensor = torch.tensor([list(input_ids)], dtype=torch.long)
-    token_type_tensor = torch.tensor(token_types, dtype=torch.long)
-    selective_mask = build_selective_attention_mask(token_type_tensor)
-
-    images = [to_pil_image(front_image), to_pil_image(bev_image)]
-    image_inputs = processor.image_processor(images=images, return_tensors="pt")
-    model_inputs = {
-        "input_ids": input_tensor,
-        "attention_mask": selective_mask,
-    }
-    model_inputs.update(image_inputs)
-    return model_inputs, token_type_tensor
-
-
 @torch.no_grad()
-def _predict_action_candidates(
+def generate_action_candidates(
     model: nn.Module,
     processor: Any,
     navigation_text: str,
@@ -284,29 +387,40 @@ def _predict_action_candidates(
     temperature: float,
     top_k: int,
 ) -> list[list[str]]:
-    """使用 backbone 在 action token 子词表上采样 K 个候选动作序列。"""
+    """第一阶段：生成 K 个未来 action token 候选。
+
+    说明：
+    - 这里仍然使用 unified-token query placeholder 思路。
+    - 由于 selective attention 会阻断 future action token 之间的可见性，
+      因此一次前向即可在每个动作 query 位置独立采样。
+    """
     tokenizer = processor.tokenizer
-    input_ids, token_types = _build_action_query_sequence(
-        tokenizer=tokenizer,
+    context_input_ids, context_token_types, pixel_values, image_sizes = _encode_multimodal_context(
+        processor=processor,
         navigation_text=navigation_text,
+        front_image=front_image,
+        bev_image=bev_image,
         history_action_token_strings=history_action_token_strings,
+        stage_tag="GEN_ACT",
+    )
+    input_ids, token_types, action_query_positions = _build_action_query_sequence(
+        tokenizer=tokenizer,
+        context_input_ids=context_input_ids,
+        context_token_types=context_token_types,
         num_action_tokens=num_action_tokens,
     )
     model_inputs, _ = _prepare_model_inputs(
-        processor=processor,
         input_ids=input_ids,
         token_types=token_types,
-        front_image=front_image,
-        bev_image=bev_image,
+        pixel_values=pixel_values,
+        image_sizes=image_sizes,
     )
     outputs = forward_batch(model, model_inputs, use_cache=False, return_dict=True)
     logits = outputs.logits[0]
 
     action_vocab_ids = [tokenizer_special_id(tokenizer, token) for token in action_vocab_tokens]
-    action_positions = [index for index, token_type in enumerate(token_types) if token_type == int(TokenType.FUTURE_ACTION)]
-
     candidates: list[list[str]] = [[] for _ in range(num_candidates)]
-    for position in action_positions:
+    for position in action_query_positions:
         sampled_token_ids = _sample_from_allowed_logits(
             logits=logits[position],
             allowed_token_ids=action_vocab_ids,
@@ -321,7 +435,7 @@ def _predict_action_candidates(
 
 
 @torch.no_grad()
-def _predict_future_bev_tokens(
+def rollout_future_bev(
     model: nn.Module,
     processor: Any,
     navigation_text: str,
@@ -333,30 +447,37 @@ def _predict_future_bev_tokens(
     future_bev_frames: int,
     num_bev_tokens_per_frame: int,
 ) -> list[str]:
-    """给定一个动作候选，预测未来 3 帧 BEV token。"""
+    """第二阶段：给定动作候选，rollout future BEV token。"""
     tokenizer = processor.tokenizer
+    context_input_ids, context_token_types, pixel_values, image_sizes = _encode_multimodal_context(
+        processor=processor,
+        navigation_text=navigation_text,
+        front_image=front_image,
+        bev_image=bev_image,
+        history_action_token_strings=history_action_token_strings,
+        stage_tag="ROLL_BEV",
+    )
     input_ids, token_types, bev_query_positions = _build_bev_query_sequence(
         tokenizer=tokenizer,
-        navigation_text=navigation_text,
-        history_action_token_strings=history_action_token_strings,
+        context_input_ids=context_input_ids,
+        context_token_types=context_token_types,
         action_token_strings=candidate_action_tokens,
         future_bev_frames=future_bev_frames,
         num_bev_tokens_per_frame=num_bev_tokens_per_frame,
     )
-    model_inputs, _ = _prepare_model_inputs(
-        processor=processor,
-        input_ids=input_ids,
-        token_types=token_types,
-        front_image=front_image,
-        bev_image=bev_image,
-    )
-    outputs = forward_batch(model, model_inputs, use_cache=False, return_dict=True)
-    logits = outputs.logits[0]
-
     bev_vocab_ids = [tokenizer_special_id(tokenizer, token) for token in bev_vocab_tokens]
+    rollout_input_ids = list(input_ids)
     predicted_tokens: list[str] = []
     for position in bev_query_positions:
-        predicted_token_id = _restrict_argmax(logits[position], bev_vocab_ids)
+        model_inputs, _ = _prepare_model_inputs(
+            input_ids=rollout_input_ids,
+            token_types=token_types,
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+        )
+        outputs = forward_batch(model, model_inputs, use_cache=False, return_dict=True)
+        predicted_token_id = _restrict_argmax(outputs.logits[0, position], bev_vocab_ids)
+        rollout_input_ids[position] = predicted_token_id
         predicted_tokens.append(str(tokenizer.convert_ids_to_tokens(predicted_token_id)))
     return predicted_tokens
 
@@ -412,6 +533,107 @@ def _score_candidate(
     }
 
 
+def _run_candidate_scorer(
+    trajectory: torch.Tensor,
+    bev_indices: Sequence[int],
+    planner_config: PlannerConfig,
+    scorer: Any | None,
+) -> dict[str, float]:
+    """执行候选打分器，默认回退到启发式 scorer。"""
+    if scorer is None:
+        return _score_candidate(
+            trajectory=trajectory,
+            bev_indices=bev_indices,
+            bev_codebook_size=planner_config.bev_codebook_size,
+            config=planner_config,
+        )
+
+    if isinstance(scorer, nn.Module):
+        scorer.eval()
+        with torch.no_grad():
+            raw_score = scorer(
+                trajectory=trajectory.unsqueeze(0),
+                bev_indices=torch.tensor([list(bev_indices)], dtype=torch.long, device=trajectory.device),
+                bev_codebook_size=planner_config.bev_codebook_size,
+                config=planner_config,
+            )
+    else:
+        raw_score = scorer(
+            trajectory=trajectory,
+            bev_indices=bev_indices,
+            bev_codebook_size=planner_config.bev_codebook_size,
+            config=planner_config,
+        )
+
+    if not isinstance(raw_score, Mapping):
+        raise TypeError("自定义 scorer 必须返回包含分数字段的 dict。")
+
+    normalized_score: dict[str, float] = {}
+    for key, value in raw_score.items():
+        if torch.is_tensor(value):
+            normalized_score[key] = float(value.detach().reshape(-1)[0].item())
+        else:
+            normalized_score[key] = float(value)
+
+    if "final_score" not in normalized_score:
+        required_keys = {"risk_score", "progress_score", "comfort_score"}
+        if not required_keys.issubset(normalized_score):
+            raise ValueError("自定义 scorer 至少要返回 `final_score`，或同时返回 risk/progress/comfort 三项。")
+        normalized_score["final_score"] = (
+            planner_config.risk_weight * normalized_score["risk_score"]
+            + planner_config.progress_weight * normalized_score["progress_score"]
+            + planner_config.comfort_weight * normalized_score["comfort_score"]
+        )
+
+    normalized_score.setdefault("risk_score", 0.0)
+    normalized_score.setdefault("progress_score", 0.0)
+    normalized_score.setdefault("comfort_score", 0.0)
+    return normalized_score
+
+
+def score_candidates(
+    action_tokenizer: ActionTokenizer,
+    candidate_action_token_strings: Sequence[Sequence[str]],
+    candidate_future_bev_token_strings: Sequence[Sequence[str]],
+    token_registry: TokenRegistry,
+    planner_config: PlannerConfig,
+    scorer: Any | None = None,
+) -> list[dict[str, Any]]:
+    """第三阶段：对候选动作进行打分。
+
+    说明：
+    - 默认使用当前启发式 scorer。
+    - 通过 `scorer` 参数可替换成 learned scorer，只要返回分数字典即可。
+    """
+    if len(candidate_action_token_strings) != len(candidate_future_bev_token_strings):
+        raise ValueError("动作候选数量和 future BEV rollout 数量必须一致。")
+
+    action_tokenizer_device = next(action_tokenizer.parameters()).device
+    scored_candidates: list[dict[str, Any]] = []
+    for candidate_tokens, bev_tokens in zip(candidate_action_token_strings, candidate_future_bev_token_strings):
+        action_indices = _token_strings_to_indices(candidate_tokens, token_registry.action_tokens)
+        action_index_tensor = torch.tensor([action_indices], dtype=torch.long, device=action_tokenizer_device)
+        trajectory = action_tokenizer.decode_from_indices(action_index_tensor)[0]
+        predicted_bev_indices = _token_strings_to_indices(bev_tokens, token_registry.bev_tokens)
+        score_dict = _run_candidate_scorer(
+            trajectory=trajectory,
+            bev_indices=predicted_bev_indices,
+            planner_config=planner_config,
+            scorer=scorer,
+        )
+        scored_candidates.append(
+            {
+                "action_token_strings": list(candidate_tokens),
+                "action_token_indices": action_indices,
+                "predicted_future_bev_tokens": list(bev_tokens),
+                "predicted_future_bev_indices": predicted_bev_indices,
+                "trajectory": trajectory.detach().cpu(),
+                **score_dict,
+            }
+        )
+    return scored_candidates
+
+
 def plan_once(
     model: nn.Module,
     processor: Any,
@@ -426,8 +648,9 @@ def plan_once(
     bev_codebook_size: int = 256,
     temperature: float = 1.0,
     top_k: int = 8,
+    scorer: Any | None = None,
 ) -> dict[str, Any]:
-    """执行一次 unified-token 自动驾驶最小版规划。
+    """执行一次两阶段 unified-token 自动驾驶最小版规划。
 
     输入：
     - navigation_text: 文本导航信息
@@ -450,32 +673,26 @@ def plan_once(
         top_k=top_k,
     )
 
-    action_vocab_tokens = build_dynamic_token_vocab("ACT", action_tokenizer.codebook_size)
-    bev_vocab_tokens = build_dynamic_token_vocab("BEV", bev_codebook_size)
-    history_action_token_strings = normalize_history_action_tokens(history_action_tokens, action_vocab_tokens)
+    token_registry = build_token_registry(action_tokenizer, bev_codebook_size)
+    history_action_token_strings = normalize_history_action_tokens(history_action_tokens, token_registry.action_tokens)
 
-    candidate_action_token_strings = _predict_action_candidates(
+    candidate_action_token_strings = generate_action_candidates(
         model=model,
         processor=processor,
         navigation_text=navigation_text,
         front_image=front_image,
         bev_image=bev_image,
         history_action_token_strings=history_action_token_strings,
-        action_vocab_tokens=action_vocab_tokens,
+        action_vocab_tokens=token_registry.action_tokens,
         num_action_tokens=action_tokenizer.num_latent_tokens,
         num_candidates=num_candidates,
         temperature=temperature,
         top_k=top_k,
     )
 
-    action_tokenizer_device = next(action_tokenizer.parameters()).device
-    all_candidates: list[dict[str, Any]] = []
+    candidate_future_bev_token_strings: list[list[str]] = []
     for candidate_tokens in candidate_action_token_strings:
-        action_indices = _token_strings_to_indices(candidate_tokens, action_vocab_tokens)
-        action_index_tensor = torch.tensor([action_indices], dtype=torch.long, device=action_tokenizer_device)
-        recon_trajectory = action_tokenizer.decode_from_indices(action_index_tensor)[0]
-
-        predicted_bev_tokens = _predict_future_bev_tokens(
+        predicted_bev_tokens = rollout_future_bev(
             model=model,
             processor=processor,
             navigation_text=navigation_text,
@@ -483,34 +700,85 @@ def plan_once(
             bev_image=bev_image,
             history_action_token_strings=history_action_token_strings,
             candidate_action_tokens=candidate_tokens,
-            bev_vocab_tokens=bev_vocab_tokens,
+            bev_vocab_tokens=token_registry.bev_tokens,
             future_bev_frames=future_bev_frames,
             num_bev_tokens_per_frame=num_bev_tokens_per_frame,
         )
-        predicted_bev_indices = _token_strings_to_indices(predicted_bev_tokens, bev_vocab_tokens)
-        score_dict = _score_candidate(
-            trajectory=recon_trajectory,
-            bev_indices=predicted_bev_indices,
-            bev_codebook_size=bev_codebook_size,
-            config=planner_config,
-        )
+        candidate_future_bev_token_strings.append(predicted_bev_tokens)
 
-        all_candidates.append(
-            {
-                "action_token_strings": candidate_tokens,
-                "action_token_indices": action_indices,
-                "predicted_future_bev_tokens": predicted_bev_tokens,
-                "predicted_future_bev_indices": predicted_bev_indices,
-                "trajectory": recon_trajectory.detach().cpu(),
-                **score_dict,
-            }
-        )
-
+    all_candidates = score_candidates(
+        action_tokenizer=action_tokenizer,
+        candidate_action_token_strings=candidate_action_token_strings,
+        candidate_future_bev_token_strings=candidate_future_bev_token_strings,
+        token_registry=token_registry,
+        planner_config=planner_config,
+        scorer=scorer,
+    )
     best_candidate = max(all_candidates, key=lambda candidate: candidate["final_score"])
     return {
         "best_candidate": best_candidate,
         "all_candidates": all_candidates,
+        "action_candidates": candidate_action_token_strings,
+        "bev_rollouts": candidate_future_bev_token_strings,
     }
+
+
+@torch.no_grad()
+def _predict_action_candidates(
+    model: nn.Module,
+    processor: Any,
+    navigation_text: str,
+    front_image: Any,
+    bev_image: Any,
+    history_action_token_strings: Sequence[str],
+    action_vocab_tokens: Sequence[str],
+    num_action_tokens: int,
+    num_candidates: int,
+    temperature: float,
+    top_k: int,
+) -> list[list[str]]:
+    """兼容旧调用：转发到新的 `generate_action_candidates(...)`。"""
+    return generate_action_candidates(
+        model=model,
+        processor=processor,
+        navigation_text=navigation_text,
+        front_image=front_image,
+        bev_image=bev_image,
+        history_action_token_strings=history_action_token_strings,
+        action_vocab_tokens=action_vocab_tokens,
+        num_action_tokens=num_action_tokens,
+        num_candidates=num_candidates,
+        temperature=temperature,
+        top_k=top_k,
+    )
+
+
+@torch.no_grad()
+def _predict_future_bev_tokens(
+    model: nn.Module,
+    processor: Any,
+    navigation_text: str,
+    front_image: Any,
+    bev_image: Any,
+    history_action_token_strings: Sequence[str],
+    candidate_action_tokens: Sequence[str],
+    bev_vocab_tokens: Sequence[str],
+    future_bev_frames: int,
+    num_bev_tokens_per_frame: int,
+) -> list[str]:
+    """兼容旧调用：转发到新的 `rollout_future_bev(...)`。"""
+    return rollout_future_bev(
+        model=model,
+        processor=processor,
+        navigation_text=navigation_text,
+        front_image=front_image,
+        bev_image=bev_image,
+        history_action_token_strings=history_action_token_strings,
+        candidate_action_tokens=candidate_action_tokens,
+        bev_vocab_tokens=bev_vocab_tokens,
+        future_bev_frames=future_bev_frames,
+        num_bev_tokens_per_frame=num_bev_tokens_per_frame,
+    )
 
 
 class _MockTokenizer:
@@ -523,6 +791,8 @@ class _MockTokenizer:
         self.unk_token_id = 2
         self.pad_token = "<pad>"
         self.eos_token = "<eos>"
+        self.unk_token = "<unk>"
+        self.image_token = "<image>"
         self._special_to_id: dict[str, int] = {
             "<pad>": self.pad_token_id,
             "<eos>": self.eos_token_id,
@@ -534,11 +804,26 @@ class _MockTokenizer:
             if token not in self._special_to_id:
                 self._special_to_id[token] = cursor
                 cursor += 1
+        self._text_to_id: dict[str, int] = {}
+        self._next_text_id = cursor + 1024
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         """把文本粗糙地编码成稳定 id。"""
         del add_special_tokens
-        return [1000 + (ord(char) % 256) for char in text]
+        normalized_text = text.replace("\n", " \n ")
+        for token in sorted(self._special_to_id, key=len, reverse=True):
+            normalized_text = normalized_text.replace(token, f" {token} ")
+
+        token_ids: list[int] = []
+        for piece in normalized_text.split():
+            if piece in self._special_to_id:
+                token_ids.append(self._special_to_id[piece])
+                continue
+            if piece not in self._text_to_id:
+                self._text_to_id[piece] = self._next_text_id
+                self._next_text_id += 1
+            token_ids.append(self._text_to_id[piece])
+        return token_ids
 
     def convert_tokens_to_ids(self, token: str) -> int:
         """把 token 字符串映射到 id。"""
@@ -563,7 +848,10 @@ class _MockImageProcessor:
             pil_image = to_pil_image(image).resize((32, 32))
             array = np.asarray(pil_image).astype(np.float32) / 255.0
             tensors.append(torch.tensor(array).permute(2, 0, 1))
-        return {"pixel_values": torch.stack(tensors, dim=0)}
+        return {
+            "pixel_values": torch.stack(tensors, dim=0),
+            "image_sizes": torch.tensor([[32, 32] for _ in images], dtype=torch.long),
+        }
 
 
 class _MockProcessor:
@@ -573,6 +861,45 @@ class _MockProcessor:
         """初始化 mock processor。"""
         self.tokenizer = _MockTokenizer(special_tokens)
         self.image_processor = _MockImageProcessor()
+        self.image_token = "<image>"
+
+    def apply_chat_template(
+        self,
+        conversation: Sequence[Mapping[str, Any]],
+        tokenize: bool = False,
+        add_generation_prompt: bool = True,
+    ) -> str:
+        """把多模态对话模板转成简单字符串。"""
+        del tokenize
+        parts: list[str] = []
+        for message in conversation:
+            parts.append(message["role"])
+            for item in message["content"]:
+                if item["type"] == "text":
+                    parts.append(str(item["text"]))
+                elif item["type"] == "image":
+                    parts.append("<image>")
+        if add_generation_prompt:
+            parts.append("assistant")
+        return " ".join(parts)
+
+    def __call__(
+        self,
+        text: Sequence[str],
+        images: Sequence[Any],
+        return_tensors: str = "pt",
+    ) -> dict[str, torch.Tensor]:
+        """模拟 Emu3Processor 的 `text + images` 多模态输入接口。"""
+        del return_tensors
+        if len(text) != 1:
+            raise ValueError("mock processor 当前只支持单条文本输入。")
+        input_ids = torch.tensor([self.tokenizer.encode(text[0], add_special_tokens=False)], dtype=torch.long)
+        image_inputs = self.image_processor(images=images, return_tensors="pt")
+        return {
+            "input_ids": input_ids,
+            "pixel_values": image_inputs["pixel_values"],
+            "image_sizes": image_inputs["image_sizes"],
+        }
 
 
 class _MockBackbone(nn.Module):
@@ -606,10 +933,8 @@ if __name__ == "__main__":
         codebook_size=32,
     )
 
-    special_tokens = list(DEFAULT_DRIVE_SPECIAL_TOKENS)
-    special_tokens += build_dynamic_token_vocab("ACT", action_tokenizer.codebook_size)
-    special_tokens += build_dynamic_token_vocab("BEV", 64)
-    processor = _MockProcessor(special_tokens)
+    token_registry = build_token_registry(action_tokenizer, bev_codebook_size=64)
+    processor = _MockProcessor(token_registry.all_special_tokens)
     model = _MockBackbone(vocab_size=5000)
 
     fake_front_image = Image.fromarray(np.random.randint(0, 255, size=(224, 224, 3), dtype=np.uint8))

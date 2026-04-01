@@ -16,7 +16,7 @@ from unitok_drive_lite.train_utils import greedy_rollout, seed_everything
 
 def parse_args() -> argparse.Namespace:
     """解析 demo 推理脚本参数。"""
-    parser = argparse.ArgumentParser(description="运行最小版 UniTok-Drive-Lite 推理演示。")
+    parser = argparse.ArgumentParser(description="运行最小版 UniTok-Drive-Lite Emu3 推理演示。")
     parser.add_argument(
         "--checkpoint_dir",
         type=str,
@@ -40,6 +40,7 @@ def main() -> None:
 
     model = UnifiedDriveModel(config).to(device)
     model.load_checkpoint(checkpoint_dir)
+    print(f"[model] backbone={config.model.model_name}")
 
     dataset = ToyUnifiedDriveDataset(
         size=max(args.sample_index + 1, 1),

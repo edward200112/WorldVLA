@@ -13,7 +13,6 @@ class TokenConfig:
     bev_size: Tuple[int, int] = (32, 32)
     image_patch_size: int = 8
     bev_patch_size: int = 8
-    image_codebook_size: int = 256
     bev_codebook_size: int = 128
     action_bins_per_dim: int = 8
     summary_bins_per_dim: int = 8
@@ -22,7 +21,10 @@ class TokenConfig:
     future_bev_frames: int = 3
     max_text_tokens: int = 32
     action_value_range: float = 1.5
-    reserved_token_start: int = 1200
+    system_prompt: str = "你是一个 unified-token 自动驾驶规划模型。"
+    action_token_prefix: str = "UT_ACT"
+    bev_token_prefix: str = "UT_BEV"
+    summary_token_prefix: str = "UT_SUM"
 
     @property
     def action_codebook_size(self) -> int:
@@ -51,11 +53,13 @@ class TokenConfig:
 
 @dataclass
 class ModelConfig:
-    """Chameleon 与 LoRA 的配置。"""
+    """Emu3 与 LoRA 的配置。"""
 
-    model_name: str = "facebook/chameleon-7b"
+    model_name: str = "BAAI/Emu3-Chat-hf"
     torch_dtype: str = "bfloat16"
     attn_implementation: str = "eager"
+    load_in_4bit: bool = False
+    use_selective_attention_mask: bool = True
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05

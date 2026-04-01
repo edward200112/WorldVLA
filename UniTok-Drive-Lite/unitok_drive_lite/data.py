@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 import torch
 from torch.utils.data import Dataset
@@ -123,16 +123,18 @@ class UnifiedDriveCollator:
         padded = [value + [pad_value] * (max_length - len(value)) for value in values]
         return torch.tensor(padded, dtype=torch.long)
 
-    def __call__(self, samples: Sequence[DriveSample]) -> Dict[str, torch.Tensor]:
+    def __call__(self, samples: Sequence[DriveSample]) -> Dict[str, Any]:
         """把一批样本编码成模型输入。"""
         encodings = [self.discretizer.build_training_sequence(sample) for sample in samples]
         input_ids = self._pad_sequences([encoding.input_ids for encoding in encodings], self.pad_token_id)
         labels = self._pad_sequences([encoding.labels for encoding in encodings], -100)
-        role_ids = self._pad_sequences([encoding.role_ids for encoding in encodings], 0)
+        token_types = self._pad_sequences([encoding.token_types for encoding in encodings], 0)
         attention_mask = input_ids.ne(self.pad_token_id).long()
         return {
             "input_ids": input_ids,
             "labels": labels,
-            "role_ids": role_ids,
+            "token_types": token_types,
             "attention_mask": attention_mask,
+            "pixel_values_list": [encoding.pixel_values for encoding in encodings],
+            "image_sizes_list": [encoding.image_sizes for encoding in encodings],
         }

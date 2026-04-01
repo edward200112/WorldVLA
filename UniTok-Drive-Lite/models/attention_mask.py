@@ -28,11 +28,45 @@ TOKEN_TYPE_TO_NAME = {
 }
 
 
-def _build_base_causal_mask(token_types: torch.Tensor) -> torch.Tensor:
+def _normalize_token_types(token_types: torch.Tensor) -> torch.Tensor:
+    """把 token_types 归一化成 [L] long 张量。"""
+    if token_types.ndim == 2:
+        if token_types.shape[0] != 1:
+            raise ValueError(f"当前只支持单条样本的 token_types，收到 {tuple(token_types.shape)}")
+        token_types = token_types[0]
+    if token_types.ndim != 1:
+        raise ValueError(f"token_types 的 shape 应为 [L]，当前收到 {tuple(token_types.shape)}")
+    return token_types.to(dtype=torch.long)
+
+
+def _normalize_valid_tokens(
+    token_types: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """把可见 token 掩码归一化成 [L] bool 张量。"""
+    if attention_mask is None:
+        return token_types.ne(int(TokenType.PAD))
+
+    if attention_mask.ndim == 2:
+        if attention_mask.shape[0] != 1:
+            raise ValueError(f"当前只支持单条样本的 attention_mask，收到 {tuple(attention_mask.shape)}")
+        attention_mask = attention_mask[0]
+    if attention_mask.ndim != 1:
+        raise ValueError(f"attention_mask 的 shape 应为 [L]，当前收到 {tuple(attention_mask.shape)}")
+    if attention_mask.shape[0] != token_types.shape[0]:
+        raise ValueError("attention_mask 与 token_types 的长度必须一致。")
+    return attention_mask.to(torch.bool) & token_types.ne(int(TokenType.PAD))
+
+
+def _build_base_causal_visibility(
+    token_types: torch.Tensor,
+    valid_tokens: torch.Tensor,
+) -> torch.Tensor:
     """构造基础的二维 causal 可见性矩阵。
 
     输入：
     - token_types: [L]
+    - valid_tokens: [L]
 
     输出：
     - allowed: [L, L]，其中 allowed[i, j] 表示第 i 个 query 是否可以看到第 j 个 key
@@ -45,8 +79,7 @@ def _build_base_causal_mask(token_types: torch.Tensor) -> torch.Tensor:
     allowed = positions.unsqueeze(0) <= positions.unsqueeze(1)
 
     # PAD token 不参与注意力。
-    valid = token_types.ne(int(TokenType.PAD))
-    allowed = allowed & valid.unsqueeze(0) & valid.unsqueeze(1)
+    allowed = allowed & valid_tokens.unsqueeze(0) & valid_tokens.unsqueeze(1)
     return allowed
 
 
@@ -93,44 +126,99 @@ def _build_future_action_context_mask(token_types: torch.Tensor) -> torch.Tensor
     return action_specific_allowed
 
 
-def build_selective_attention_mask(token_types: torch.Tensor) -> torch.Tensor:
-    """构造适用于 Hugging Face causal LM 的 4D additive selective attention mask。
+def build_selective_attention_visibility(
+    token_types: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """构造 selective attention 的二维可见性矩阵。
 
     输入：
     - token_types: [L]，每个位置是一个整数类别编号，类别定义见 TokenType
+    - attention_mask: [L] 或 [1, L]，1 表示有效 token，0 表示 padding；可选
 
     输出：
-    - mask: [1, 1, L, L]
-      - 可见位置为 0.0
-      - 不可见位置为一个极小负数
+    - visibility: [L, L]，True 表示可见，False 表示不可见
 
     注意：
-    - 这是 additive mask，通常可以直接传给 Hugging Face causal LM 的 `attention_mask`
     - 行表示 query，列表示 key
     """
-    if token_types.ndim != 1:
-        raise ValueError(f"token_types 的 shape 应为 [L]，当前收到 {tuple(token_types.shape)}")
-
-    token_types = token_types.to(dtype=torch.long)
-    base_causal_allowed = _build_base_causal_mask(token_types)
+    token_types = _normalize_token_types(token_types)
+    valid_tokens = _normalize_valid_tokens(token_types, attention_mask)
+    base_causal_allowed = _build_base_causal_visibility(token_types, valid_tokens)
     future_action_specific_allowed = _build_future_action_context_mask(token_types)
+    return base_causal_allowed & future_action_specific_allowed
 
-    final_allowed = base_causal_allowed & future_action_specific_allowed
+
+def build_selective_attention_mask(
+    token_types: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    dtype: torch.dtype = torch.float32,
+    expand_batch_dim: bool = True,
+) -> torch.Tensor:
+    """构造适用于 Hugging Face causal LM 的 additive selective attention mask。
+
+    输入：
+    - token_types: [L]，每个位置是一个整数类别编号，类别定义见 TokenType
+    - attention_mask: [L] 或 [1, L]，1 表示有效 token，0 表示 padding；可选
+    - dtype: 输出 additive mask 的浮点类型
+    - expand_batch_dim: 是否扩成 [1, 1, L, L]
+
+    输出：
+    - 若 expand_batch_dim=True，返回 [1, 1, L, L]
+    - 否则返回 [L, L]
+
+    注意：
+    - 这是训练 / 全序列前向最稳妥的接法，可以直接送进 Emu3 的 `forward(...)`
+    - 对 `generate(...)` 而言，Transformers 通常更稳定地支持 2D padding mask，因此不建议直接复用 4D mask
+    """
+    token_types = _normalize_token_types(token_types)
+    final_allowed = build_selective_attention_visibility(token_types, attention_mask=attention_mask)
 
     additive_mask = torch.zeros(
-        (1, 1, token_types.shape[0], token_types.shape[0]),
-        dtype=torch.float32,
+        (token_types.shape[0], token_types.shape[0]),
+        dtype=dtype,
         device=token_types.device,
     )
-    additive_mask = additive_mask.masked_fill(~final_allowed.unsqueeze(0).unsqueeze(0), torch.finfo(torch.float32).min)
+    additive_mask = additive_mask.masked_fill(~final_allowed, torch.finfo(dtype).min)
+    if expand_batch_dim:
+        additive_mask = additive_mask.unsqueeze(0).unsqueeze(0)
     return additive_mask
+
+
+def build_generation_attention_mask(
+    token_types: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """构造给 `generate(...)` 使用的 2D padding mask。
+
+    说明：
+    - 这里只保留“有效 token / padding”信息，不表达 selective action 约束。
+    - 如果推理阶段必须严格保持 future action 互不可见，应改用 `forward(...)` 手工逐步解码，
+      或像当前 planner 一样直接做 query 位置打分，而不是依赖 `model.generate(...)`。
+    """
+    token_types = _normalize_token_types(token_types)
+    valid_tokens = _normalize_valid_tokens(token_types, attention_mask)
+    return valid_tokens.to(dtype=torch.long).unsqueeze(0)
+
+
+def infer_padding_mask_from_additive_attention_mask(mask: torch.Tensor) -> torch.Tensor:
+    """从 additive 4D mask 反推出 2D padding mask。
+
+    说明：
+    - 该函数只提取“哪些 token 有效”，不会保留 selective visibility 细节。
+    - 主要用于 Emu3 `generate(...)` 的近似回退路径。
+    """
+    if mask.ndim != 4 or mask.shape[1] != 1:
+        raise ValueError(f"mask 必须是 [B, 1, L, L]，当前收到 {tuple(mask.shape)}")
+    diagonal = torch.diagonal(mask[:, 0], dim1=-2, dim2=-1)
+    return diagonal.eq(0).to(dtype=torch.long)
 
 
 def _mask_to_boolean_visibility(mask: torch.Tensor) -> torch.Tensor:
     """把 4D additive mask 转回布尔可见矩阵，便于调试打印。"""
     if mask.ndim == 4:
         if mask.shape[0] != 1 or mask.shape[1] != 1:
-            raise ValueError(f"当前只支持 [1, 1, L, L] 的 mask，收到 {tuple(mask.shape)}")
+            raise ValueError(f"当前只支持 [1, 1, L, L] 的可视化，收到 {tuple(mask.shape)}")
         return mask[0, 0].eq(0)
     if mask.ndim == 2:
         return mask.eq(0)

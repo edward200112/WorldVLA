@@ -1,29 +1,51 @@
 from __future__ import annotations
 
+from models.attention_mask import (
+    TOKEN_TYPE_TO_NAME,
+    TokenType,
+    build_generation_attention_mask as _build_generation_attention_mask,
+    build_selective_attention_mask as _build_selective_attention_mask,
+    build_selective_attention_visibility,
+    print_attention_mask_visualization,
+)
 import torch
 
 
 def build_selective_attention_mask(
     attention_mask: torch.Tensor,
-    role_ids: torch.Tensor,
+    token_types: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """构造 selective 4D additive attention mask。"""
-    batch_size, seq_length = attention_mask.shape
-    device = attention_mask.device
+    """构造 selective 4D additive attention mask。
 
-    positions = torch.arange(seq_length, device=device)
-    causal = positions.unsqueeze(0) <= positions.unsqueeze(1)
-    causal = causal.unsqueeze(0).expand(batch_size, -1, -1)
+    说明：
+    - `unitok_drive_lite` 主链路历史上把 padding mask 和 token_types 分开传入。
+    - 为了避免与顶层 `models/attention_mask.py` 继续分叉，这里统一委托给共享实现。
+    """
+    return _build_selective_attention_mask(
+        token_types=token_types,
+        attention_mask=attention_mask,
+        dtype=dtype,
+        expand_batch_dim=True,
+    )
 
-    valid = attention_mask.to(torch.bool)
-    valid_pairs = valid.unsqueeze(1) & valid.unsqueeze(2)
-    allowed = causal & valid_pairs
 
-    is_raw_action = role_ids.eq(1)
-    raw_action_pairs = is_raw_action.unsqueeze(1) & is_raw_action.unsqueeze(2)
-    allowed = allowed & ~raw_action_pairs
+def build_generation_attention_mask(
+    attention_mask: torch.Tensor,
+    token_types: torch.Tensor,
+) -> torch.Tensor:
+    """构造 Emu3 `generate(...)` 使用的近似 2D padding mask。"""
+    return _build_generation_attention_mask(
+        token_types=token_types,
+        attention_mask=attention_mask,
+    )
 
-    additive_mask = torch.zeros((batch_size, 1, seq_length, seq_length), dtype=dtype, device=device)
-    additive_mask = additive_mask.masked_fill(~allowed.unsqueeze(1), torch.finfo(dtype).min)
-    return additive_mask
+
+__all__ = [
+    "TOKEN_TYPE_TO_NAME",
+    "TokenType",
+    "build_generation_attention_mask",
+    "build_selective_attention_mask",
+    "build_selective_attention_visibility",
+    "print_attention_mask_visualization",
+]

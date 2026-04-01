@@ -22,9 +22,17 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     """把 batch 里的 tensor 全部移动到目标设备。"""
-    return {name: value.to(device) for name, value in batch.items()}
+    moved_batch: Dict[str, Any] = {}
+    for name, value in batch.items():
+        if torch.is_tensor(value):
+            moved_batch[name] = value.to(device)
+        elif isinstance(value, list):
+            moved_batch[name] = [item.to(device) if torch.is_tensor(item) else item for item in value]
+        else:
+            moved_batch[name] = value
+    return moved_batch
 
 
 def build_optimizer(model: UnifiedDriveModel, config: ExperimentConfig) -> AdamW:
@@ -53,7 +61,9 @@ def train_one_epoch(
         outputs = model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
-            role_ids=batch["role_ids"],
+            token_types=batch["token_types"],
+            pixel_values_list=batch["pixel_values_list"],
+            image_sizes_list=batch["image_sizes_list"],
             labels=batch["labels"],
         )
         loss = outputs["loss"]
@@ -112,12 +122,14 @@ def greedy_rollout(
     model.eval()
     query_encoding = model.discretizer.build_generation_queries(sample)
     input_tensor = torch.tensor([query_encoding.input_ids], dtype=torch.long, device=device)
-    role_tensor = torch.tensor([query_encoding.role_ids], dtype=torch.long, device=device)
+    token_type_tensor = torch.tensor([query_encoding.token_types], dtype=torch.long, device=device)
     attention_mask = torch.ones_like(input_tensor)
     outputs = model(
         input_ids=input_tensor,
         attention_mask=attention_mask,
-        role_ids=role_tensor,
+        token_types=token_type_tensor,
+        pixel_values_list=[query_encoding.pixel_values.to(device)],
+        image_sizes_list=[query_encoding.image_sizes.to(device)],
         labels=None,
     )
     logits = outputs["logits"]

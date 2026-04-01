@@ -1,6 +1,12 @@
 torch>=2.1.0
-transformers>=4.48.0
+transformers>=4.52.0
 peft>=0.13.0
 accelerate>=0.34.0
 sentencepiece>=0.2.0
 huggingface_hub>=0.24.0
+numpy>=1.26.0
+Pillow>=10.0.0
+opencv-python-headless>=4.10.0
+
+# 低显存 4-bit 路径，优先在 Linux + CUDA 环境使用。
+bitsandbytes>=0.43.0; platform_system == "Linux"
