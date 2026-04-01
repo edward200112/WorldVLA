@@ -1,3 +1,9 @@
+"""Deprecated: 顶层 Emu3 backbone 实验封装。
+
+当前仓库的唯一权威运行主链路是 `scripts/` + `unitok_drive_lite/`。
+本文件仅保留给顶层实验脚本和兼容旧调用使用，不再作为官方主干入口维护。
+"""
+
 from __future__ import annotations
 
 """Emu3 主干加载与前向辅助工具。

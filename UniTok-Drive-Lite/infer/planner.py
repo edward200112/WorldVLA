@@ -1,3 +1,9 @@
+"""Deprecated: 顶层 planner 实验实现。
+
+当前仓库的唯一权威运行主链路是 `scripts/` + `unitok_drive_lite/`。
+本文件仅保留给规划算法实验、mock demo 和兼容旧调用使用，不再作为官方推理入口维护。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

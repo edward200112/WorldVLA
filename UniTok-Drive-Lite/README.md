@@ -8,7 +8,7 @@
 - 微调方式：LoRA only，不做全量参数更新
 - 低显存路径：支持 4-bit 量化加载
 - 当前权威主链路：`scripts/` + `unitok_drive_lite/`
-- 顶层 `data/ infer/ models/ train/`：保留为实验组件和独立 demo，不作为当前唯一真源
+- 顶层 `data/ infer/ models/ train/`：已降级为兼容层 / 实验目录，不再作为官方主链路维护
 
 ## 真实实现边界
 
@@ -78,7 +78,7 @@
 - `scripts/run_demo.py`
 - `unitok_drive_lite/`
 
-如果后续继续迭代 Emu3 主线，优先修改这套代码，再考虑是否同步顶层实验目录。
+如果后续继续迭代 Emu3 主线，优先修改这套代码。顶层实验目录只做兼容保留，不应再作为默认改造目标。
 
 ## 目录概览
 

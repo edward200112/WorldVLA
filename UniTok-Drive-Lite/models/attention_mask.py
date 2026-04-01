@@ -1,3 +1,9 @@
+"""Deprecated: 顶层 attention mask 实验实现。
+
+当前仓库的唯一权威运行主链路是 `scripts/` + `unitok_drive_lite/`。
+本文件继续保留给顶层实验脚本和兼容旧调用使用，不再作为官方主链路单独维护。
+"""
+
 from __future__ import annotations
 
 from enum import IntEnum

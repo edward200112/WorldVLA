@@ -1,3 +1,9 @@
+"""官方最小推理入口。
+
+当前仓库默认只维护 `scripts/` + `unitok_drive_lite/` 这条主链路。
+如果后续继续迁移 Emu3 或调整 unified-token 推理逻辑，应优先修改这里及其包内依赖。
+"""
+
 from __future__ import annotations
 
 import argparse

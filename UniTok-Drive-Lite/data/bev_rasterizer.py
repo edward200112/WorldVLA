@@ -1,3 +1,9 @@
+"""Deprecated: 顶层 BEV 渲染实验组件。
+
+当前仓库的唯一权威运行主链路是 `scripts/` + `unitok_drive_lite/`。
+本文件继续保留给数据预处理实验和 demo 使用，不再作为官方主链路的一部分维护。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

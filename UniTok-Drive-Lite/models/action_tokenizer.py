@@ -1,3 +1,9 @@
+"""Deprecated: 顶层 action tokenizer 组件。
+
+当前仓库的唯一权威运行主链路是 `scripts/` + `unitok_drive_lite/`。
+本文件继续保留给独立实验脚本复用，不再作为官方主链路的一部分维护。
+"""
+
 from __future__ import annotations
 
 from typing import Dict

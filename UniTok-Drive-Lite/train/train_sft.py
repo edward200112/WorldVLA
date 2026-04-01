@@ -1,3 +1,9 @@
+"""Deprecated: 顶层 SFT 实验训练脚本。
+
+当前仓库的唯一权威运行主链路是 `scripts/` + `unitok_drive_lite/`。
+本文件仅保留给自定义数据实验和兼容旧调用使用，不再作为默认训练入口维护。
+"""
+
 from __future__ import annotations
 
 import argparse

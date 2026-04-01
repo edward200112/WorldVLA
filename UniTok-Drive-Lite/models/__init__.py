@@ -1,3 +1,9 @@
+"""Deprecated: 顶层 models 实验组件集合。
+
+当前仓库的唯一权威运行主链路是 `scripts/` + `unitok_drive_lite/`。
+这里导出的内容只保留给顶层实验脚本复用，不再作为官方主链路的一部分维护。
+"""
+
 from .action_tokenizer import ActionTokenizer
 from .attention_mask import (
     TokenType,
