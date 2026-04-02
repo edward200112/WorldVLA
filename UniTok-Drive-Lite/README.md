@@ -206,6 +206,9 @@ python3 train/train_sft.py --data_path path/to/your_samples.pt
 - 只训练 LoRA 参数（rank=16, alpha=32）
 - 以及新增 special token 对应的 embedding / lm_head 行
 
+当前主链路不会把整块 `embed_tokens` / `lm_head` 设为可训练后再做梯度掩码，
+而是只为“新增 token 行”保留小规模参数，这样更适合 24G 显存级别的 LoRA 微调。
+
 ### 两阶段 planner
 
 planner 拆成四个核心函数：

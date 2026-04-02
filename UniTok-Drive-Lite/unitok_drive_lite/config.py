@@ -59,6 +59,7 @@ class ModelConfig:
     torch_dtype: str = "bfloat16"
     attn_implementation: str = "eager"
     load_in_4bit: bool = False
+    gradient_checkpointing: bool = True
     use_selective_attention_mask: bool = True
     lora_rank: int = 16
     lora_alpha: int = 32

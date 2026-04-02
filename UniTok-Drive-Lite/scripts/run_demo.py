@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
         default="outputs/unitok_drive_lite/checkpoint_last",
     )
     parser.add_argument("--sample_index", type=int, default=0)
+    parser.add_argument("--load_in_4bit", action="store_true")
     return parser.parse_args()
 
 
@@ -41,12 +42,14 @@ def main() -> None:
         raise FileNotFoundError(f"未找到检查点目录: {checkpoint_dir}")
 
     config = build_default_config(project_root)
+    config.model.load_in_4bit = args.load_in_4bit
     seed_everything(config.train.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = UnifiedDriveModel(config).to(device)
     model.load_checkpoint(checkpoint_dir)
     print(f"[model] backbone={config.model.model_name}")
+    print(f"[model] load_in_4bit={config.model.load_in_4bit}")
 
     dataset = ToyUnifiedDriveDataset(
         size=max(args.sample_index + 1, 1),

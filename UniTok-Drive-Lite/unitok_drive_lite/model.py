@@ -6,6 +6,7 @@ import warnings
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from .config import ExperimentConfig
 from .discretizer import UnifiedDriveDiscretizer
@@ -41,6 +42,115 @@ def _freeze_all_parameters(model: nn.Module) -> None:
     """冻结模型全部参数。"""
     for parameter in model.parameters():
         parameter.requires_grad = False
+
+
+class TrainableTokenEmbedding(nn.Module):
+    """冻结原始 embedding，仅为新增 token 行保留小规模可训练参数。"""
+
+    def __init__(self, base_embedding: nn.Module, trainable_token_start: int) -> None:
+        super().__init__()
+        if not hasattr(base_embedding, "weight"):
+            raise TypeError("输入 embedding 模块必须暴露 `weight`。")
+        self.base_embedding = base_embedding
+        self.trainable_token_start = int(trainable_token_start)
+        base_embedding.weight.requires_grad = False
+
+        num_embeddings, embedding_dim = base_embedding.weight.shape
+        self.num_embeddings = int(num_embeddings)
+        self.embedding_dim = int(embedding_dim)
+        num_new_tokens = self.num_embeddings - self.trainable_token_start
+        if num_new_tokens < 0:
+            raise ValueError("trainable_token_start 不能大于 embedding 词表大小。")
+        if num_new_tokens > 0:
+            initial_rows = base_embedding.weight[self.trainable_token_start :].detach().clone()
+            self.new_embedding_rows = nn.Parameter(initial_rows)
+        else:
+            self.register_parameter("new_embedding_rows", None)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        """返回逻辑上的完整 embedding 权重，仅用于调试/检查。"""
+        if self.new_embedding_rows is None:
+            return self.base_embedding.weight
+        return torch.cat(
+            [
+                self.base_embedding.weight[: self.trainable_token_start],
+                self.new_embedding_rows,
+            ],
+            dim=0,
+        )
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        outputs = self.base_embedding(input_ids)
+        if self.new_embedding_rows is None:
+            return outputs
+        new_token_mask = input_ids.ge(self.trainable_token_start)
+        if not bool(new_token_mask.any().item()):
+            return outputs
+        outputs = outputs.clone()
+        new_row_indices = (input_ids[new_token_mask] - self.trainable_token_start).to(torch.long)
+        outputs[new_token_mask] = self.new_embedding_rows[new_row_indices]
+        return outputs
+
+
+class TrainableTokenLMHead(nn.Module):
+    """冻结原始 lm_head，仅让新增 token 行可训练。"""
+
+    def __init__(self, base_lm_head: nn.Module, trainable_token_start: int) -> None:
+        super().__init__()
+        if not isinstance(base_lm_head, nn.Linear):
+            raise TypeError(f"暂不支持为 {type(base_lm_head)} 构造 trainable lm_head。")
+        self.base_lm_head = base_lm_head
+        self.trainable_token_start = int(trainable_token_start)
+
+        base_lm_head.weight.requires_grad = False
+        if base_lm_head.bias is not None:
+            base_lm_head.bias.requires_grad = False
+
+        self.in_features = int(base_lm_head.in_features)
+        self.out_features = int(base_lm_head.out_features)
+        num_new_tokens = self.out_features - self.trainable_token_start
+        if num_new_tokens < 0:
+            raise ValueError("trainable_token_start 不能大于 lm_head 词表大小。")
+        if num_new_tokens > 0:
+            self.new_lm_head_weight = nn.Parameter(
+                base_lm_head.weight[self.trainable_token_start :].detach().clone()
+            )
+            if base_lm_head.bias is not None:
+                self.new_lm_head_bias = nn.Parameter(
+                    base_lm_head.bias[self.trainable_token_start :].detach().clone()
+                )
+            else:
+                self.register_parameter("new_lm_head_bias", None)
+        else:
+            self.register_parameter("new_lm_head_weight", None)
+            self.register_parameter("new_lm_head_bias", None)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        """返回逻辑上的完整 lm_head 权重，仅用于调试/检查。"""
+        if self.new_lm_head_weight is None:
+            return self.base_lm_head.weight
+        return torch.cat(
+            [
+                self.base_lm_head.weight[: self.trainable_token_start],
+                self.new_lm_head_weight,
+            ],
+            dim=0,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        old_weight = self.base_lm_head.weight[: self.trainable_token_start]
+        old_bias = (
+            None
+            if self.base_lm_head.bias is None
+            else self.base_lm_head.bias[: self.trainable_token_start]
+        )
+        old_logits = F.linear(hidden_states, old_weight, old_bias)
+        if self.new_lm_head_weight is None:
+            return old_logits
+        new_logits = F.linear(hidden_states, self.new_lm_head_weight, self.new_lm_head_bias)
+        return torch.cat([old_logits, new_logits], dim=-1)
 
 
 def _collect_embedding_like_parameters(model: nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
@@ -181,6 +291,9 @@ class UnifiedDriveModel(nn.Module):
             **pretrained_kwargs,
         )
         self._sync_model_vocab_with_tokenizer(backbone)
+        self._attach_trainable_new_token_modules(backbone)
+        if config.model.gradient_checkpointing and hasattr(backbone, "gradient_checkpointing_enable"):
+            backbone.gradient_checkpointing_enable()
         backbone.config.use_cache = False
 
         if config.model.load_in_4bit:
@@ -193,13 +306,10 @@ class UnifiedDriveModel(nn.Module):
             lora_alpha=config.model.lora_alpha,
             lora_dropout=config.model.lora_dropout,
             target_modules=list(config.model.lora_target_modules),
-            modules_to_save=["embed_tokens", "lm_head"],
             bias="none",
             task_type=TaskType.CAUSAL_LM,
         )
         self.backbone = get_peft_model(backbone, lora_config)
-        if len(self.tokenizer) > self.trainable_token_start:
-            _enable_only_new_token_rows(self.backbone, self.trainable_token_start)
 
         self.discretizer = UnifiedDriveDiscretizer(
             tokenizer=self.tokenizer,
@@ -344,6 +454,33 @@ class UnifiedDriveModel(nn.Module):
             raise RuntimeError(
                 "显式 lm_head 扩词后仍与 tokenizer 不一致: "
                 f"tokenizer={tokenizer_vocab_size} lm_head_vocab={direct_lm_head_vocab_size_after}"
+            )
+
+    def _attach_trainable_new_token_modules(self, backbone: nn.Module) -> None:
+        """把新增 token 行替换为小规模可训练模块，避免整块 embedding/lm_head 反向。"""
+        if len(self.tokenizer) <= self.trainable_token_start:
+            return
+
+        input_embeddings = backbone.get_input_embeddings()
+        if input_embeddings is None:
+            raise RuntimeError("无法获取模型输入 embedding。")
+        if not isinstance(input_embeddings, TrainableTokenEmbedding):
+            wrapped_embedding = TrainableTokenEmbedding(
+                base_embedding=input_embeddings,
+                trainable_token_start=self.trainable_token_start,
+            )
+            if hasattr(backbone, "set_input_embeddings"):
+                backbone.set_input_embeddings(wrapped_embedding)
+            elif hasattr(backbone, "model") and hasattr(backbone.model, "embed_tokens"):
+                backbone.model.embed_tokens = wrapped_embedding
+            else:
+                raise RuntimeError("无法把 trainable embedding 注入到底模。")
+
+        direct_lm_head = getattr(backbone, "lm_head", None)
+        if direct_lm_head is not None and not isinstance(direct_lm_head, TrainableTokenLMHead):
+            backbone.lm_head = TrainableTokenLMHead(
+                base_lm_head=direct_lm_head,
+                trainable_token_start=self.trainable_token_start,
             )
 
     def _format_token_from_id(self, token_id: int) -> str:
@@ -539,12 +676,14 @@ class UnifiedDriveModel(nn.Module):
         return total_parameters, trainable_parameters
 
     def adapter_state_dict(self) -> Dict[str, Any]:
-        """只导出 LoRA 参数和新增 token 行。"""
+        """只导出 LoRA 参数和新增 token 小模块参数。"""
         state_dict = self.backbone.state_dict()
-        new_token_rows: Dict[str, torch.Tensor] = {}
-        for name, tensor in state_dict.items():
-            if "embed_tokens.weight" in name or "lm_head.weight" in name:
-                new_token_rows[name] = tensor[self.trainable_token_start :].detach().cpu()
+        trainable_non_lora: Dict[str, torch.Tensor] = {}
+        named_parameters = dict(self.backbone.named_parameters())
+        for name, parameter in named_parameters.items():
+            if not parameter.requires_grad or "lora_" in name:
+                continue
+            trainable_non_lora[name] = parameter.detach().cpu()
 
         return {
             "lora": {
@@ -552,7 +691,7 @@ class UnifiedDriveModel(nn.Module):
                 for name, tensor in state_dict.items()
                 if "lora_" in name
             },
-            "new_token_rows": new_token_rows,
+            "trainable_non_lora": trainable_non_lora,
             "trainable_token_start": self.trainable_token_start,
         }
 
@@ -570,12 +709,6 @@ class UnifiedDriveModel(nn.Module):
         lora_state = checkpoint.get("lora", checkpoint)
         self.backbone.load_state_dict(lora_state, strict=False)
 
-        start_index = int(checkpoint.get("trainable_token_start", self.trainable_token_start))
-        named_parameters = dict(self.backbone.named_parameters())
-        for name, rows in checkpoint.get("new_token_rows", {}).items():
-            parameter = named_parameters.get(name)
-            if parameter is None:
-                continue
-            parameter.data[start_index : start_index + rows.shape[0]].copy_(
-                rows.to(device=parameter.device, dtype=parameter.dtype)
-            )
+        extra_trainable_state = checkpoint.get("trainable_non_lora", {})
+        if extra_trainable_state:
+            self.backbone.load_state_dict(extra_trainable_state, strict=False)

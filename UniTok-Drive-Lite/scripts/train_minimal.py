@@ -38,6 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_size", type=int, default=8)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--output_dir", type=str, default="outputs/unitok_drive_lite")
+    parser.add_argument("--load_in_4bit", action="store_true")
+    parser.add_argument("--no_gradient_checkpointing", action="store_true")
     return parser.parse_args()
 
 
@@ -49,12 +51,18 @@ def main() -> None:
     config.train.dataset_size = args.dataset_size
     config.train.num_epochs = args.num_epochs
     config.train.output_dir = args.output_dir
+    config.model.load_in_4bit = args.load_in_4bit
+    config.model.gradient_checkpointing = not args.no_gradient_checkpointing
 
     seed_everything(config.train.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = UnifiedDriveModel(config).to(device)
     print(f"[model] backbone={config.model.model_name}")
+    print(
+        f"[model] load_in_4bit={config.model.load_in_4bit} "
+        f"gradient_checkpointing={config.model.gradient_checkpointing}"
+    )
     total_parameters, trainable_parameters = model.count_trainable_parameters()
     print(f"[model] total_parameters={total_parameters:,}")
     print(f"[model] trainable_parameters={trainable_parameters:,}")
