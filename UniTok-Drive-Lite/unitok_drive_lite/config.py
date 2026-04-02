@@ -55,7 +55,7 @@ class TokenConfig:
 class ModelConfig:
     """Emu3 与 LoRA 的配置。"""
 
-    model_name: str = "BAAI/Emu3-Chat-hf"
+    model_name: str = "hf_models/Emu3-Chat-hf"
     torch_dtype: str = "bfloat16"
     attn_implementation: str = "eager"
     load_in_4bit: bool = False
