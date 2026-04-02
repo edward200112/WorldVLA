@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     add_dataset_selection_args(parser)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--output_dir", type=str, default="outputs/unitok_drive_lite")
+    parser.add_argument("--action_loss_weight", type=float, default=6.0)
+    parser.add_argument("--future_bev_loss_weight", type=float, default=1.0)
+    parser.add_argument("--supervise_action_only", action="store_true")
     parser.add_argument("--load_in_4bit", action="store_true")
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
     return parser.parse_args()
@@ -50,6 +53,9 @@ def main() -> None:
     config = build_default_config(project_root)
     config.train.num_epochs = args.num_epochs
     config.train.output_dir = args.output_dir
+    config.train.action_loss_weight = args.action_loss_weight
+    config.train.future_bev_loss_weight = args.future_bev_loss_weight
+    config.train.supervise_action_only = args.supervise_action_only
     config.model.load_in_4bit = args.load_in_4bit
     config.model.gradient_checkpointing = not args.no_gradient_checkpointing
 
@@ -73,6 +79,11 @@ def main() -> None:
     print(
         f"[model] load_in_4bit={config.model.load_in_4bit} "
         f"gradient_checkpointing={config.model.gradient_checkpointing}"
+    )
+    print(
+        f"[train] action_loss_weight={config.train.action_loss_weight} "
+        f"future_bev_loss_weight={config.train.future_bev_loss_weight} "
+        f"supervise_action_only={config.train.supervise_action_only}"
     )
     total_parameters, trainable_parameters = model.count_trainable_parameters()
     print(f"[model] total_parameters={total_parameters:,}")

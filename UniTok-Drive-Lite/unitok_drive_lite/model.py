@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .config import ExperimentConfig
 from .discretizer import UnifiedDriveDiscretizer
-from .masking import build_selective_attention_mask
+from .masking import TokenType, build_selective_attention_mask
 from .token_registry import TokenRegistry
 
 try:
@@ -266,6 +266,7 @@ class UnifiedDriveModel(nn.Module):
         tokenizer_vocab_size_after = len(self.tokenizer)
         self.trainable_token_start = tokenizer_vocab_size_before
         self._token_debug_header_printed = False
+        self._loss_debug_printed = False
         self._tokenizer_resize_debug = {
             "tokenizer_vocab_size_before": tokenizer_vocab_size_before,
             "num_added_tokens": int(num_added_tokens),
@@ -582,6 +583,66 @@ class UnifiedDriveModel(nn.Module):
                 f"offending_positions={offending_records}"
             )
 
+    def _compute_weighted_training_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        token_types: torch.Tensor,
+    ) -> torch.Tensor:
+        """按 token 类型对训练监督做最小加权。"""
+        flat_logits = logits.view(-1, logits.size(-1))
+        flat_labels = labels.view(-1)
+        flat_token_types = token_types.view(-1)
+        valid_mask = flat_labels.ne(-100)
+        if not bool(valid_mask.any().item()):
+            raise RuntimeError("训练 batch 中没有任何有效监督 token。")
+
+        valid_logits = flat_logits[valid_mask]
+        valid_labels = flat_labels[valid_mask]
+        valid_token_types = flat_token_types[valid_mask]
+        allowed_supervised_types = (
+            valid_token_types.eq(int(TokenType.FUTURE_ACTION))
+            | valid_token_types.eq(int(TokenType.FUTURE_BEV))
+        )
+        if not bool(allowed_supervised_types.all().item()):
+            offending_types = torch.unique(valid_token_types[~allowed_supervised_types]).tolist()
+            raise RuntimeError(
+                "检测到非 FUTURE_ACTION / FUTURE_BEV token 被用于监督。"
+                f" offending_token_types={offending_types}"
+            )
+
+        per_token_loss = F.cross_entropy(valid_logits, valid_labels, reduction="none")
+        loss_weights = torch.full_like(
+            per_token_loss,
+            fill_value=float(self.config.train.future_bev_loss_weight),
+        )
+        action_mask = valid_token_types.eq(int(TokenType.FUTURE_ACTION))
+        future_bev_mask = valid_token_types.eq(int(TokenType.FUTURE_BEV))
+        if bool(action_mask.any().item()):
+            loss_weights[action_mask] = float(self.config.train.action_loss_weight)
+        if self.config.train.supervise_action_only:
+            loss_weights[future_bev_mask] = 0.0
+
+        effective_weight_sum = loss_weights.sum()
+        if float(effective_weight_sum.item()) <= 0.0:
+            raise RuntimeError(
+                "所有监督 token 的 loss 权重都为 0。"
+                "请检查 action_loss_weight / future_bev_loss_weight / supervise_action_only 配置。"
+            )
+
+        if not self._loss_debug_printed:
+            print(
+                "[debug:loss] "
+                f"future_action_token_count={int(action_mask.sum().item())} "
+                f"future_bev_token_count={int(future_bev_mask.sum().item())} "
+                f"action_loss_weight={float(self.config.train.action_loss_weight):.4f} "
+                f"future_bev_loss_weight={float(self.config.train.future_bev_loss_weight):.4f} "
+                f"supervise_action_only={self.config.train.supervise_action_only}"
+            )
+            self._loss_debug_printed = True
+
+        return (per_token_loss * loss_weights).sum() / effective_weight_sum
+
     @property
     def device(self) -> torch.device:
         """返回当前模型所在设备。"""
@@ -660,8 +721,11 @@ class UnifiedDriveModel(nn.Module):
         loss: Optional[torch.Tensor] = None
         if labels is not None:
             self._validate_labels_before_loss(input_ids, labels, logits)
-            loss_function = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_function(logits.view(-1, logits.size(-1)), labels.view(-1))
+            loss = self._compute_weighted_training_loss(
+                logits=logits,
+                labels=labels,
+                token_types=token_types,
+            )
         return {"logits": logits, "loss": loss}
 
     def count_trainable_parameters(self) -> tuple[int, int]:

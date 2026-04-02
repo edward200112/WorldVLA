@@ -177,6 +177,9 @@ python3 scripts/train_minimal.py --dataset_type toy --dataset_size 8 --num_epoch
 - `--max_samples`：限制 nuScenes 样本数，便于最小 smoke test
 - `--num_epochs`：训练轮数（默认 1）
 - `--output_dir`：checkpoint 保存路径（默认 `outputs/unitok_drive_lite`）
+- `--action_loss_weight`：future action token 的监督权重，默认 `6.0`
+- `--future_bev_loss_weight`：future BEV token 的监督权重，默认 `1.0`
+- `--supervise_action_only`：只监督 future action token，适合做极小 overfit 诊断
 
 训练完成后 checkpoint 保存到：
 
@@ -262,6 +265,18 @@ python3 scripts/validate_overfit_minimal.py \
 - quantized / raw trajectory 误差
 - GT / Pred future BEV 差异统计
 - 可选 `.pt` 调试产物（`--save_debug_artifacts`）
+
+如果怀疑 action 监督被 future BEV 压制，可以先用：
+
+```bash
+python3 scripts/validate_overfit_minimal.py \
+  --dataset_type nuscenes \
+  --nuscenes_root /path/to/nuscenes \
+  --max_samples 1 \
+  --max_train_samples 1 \
+  --num_epochs 20 \
+  --supervise_action_only
+```
 
 ### 4. Action 分布分析
 

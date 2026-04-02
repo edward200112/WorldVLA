@@ -78,6 +78,9 @@ class TrainConfig:
     num_epochs: int = 1
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
+    action_loss_weight: float = 6.0
+    future_bev_loss_weight: float = 1.0
+    supervise_action_only: bool = False
     max_grad_norm: float = 1.0
     log_every: int = 1
     output_dir: str = "outputs/unitok_drive_lite"

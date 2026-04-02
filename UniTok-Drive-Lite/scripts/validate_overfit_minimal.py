@@ -43,6 +43,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--max_train_samples", type=int, default=4)
     parser.add_argument("--output_dir", type=str, default="outputs/unitok_drive_lite_overfit")
+    parser.add_argument("--action_loss_weight", type=float, default=6.0)
+    parser.add_argument("--future_bev_loss_weight", type=float, default=1.0)
+    parser.add_argument("--supervise_action_only", action="store_true")
     parser.add_argument("--load_in_4bit", action="store_true")
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
     parser.add_argument("--save_debug_artifacts", action="store_true")
@@ -107,6 +110,9 @@ def main() -> None:
     config = build_default_config(PROJECT_ROOT)
     config.train.num_epochs = args.num_epochs
     config.train.output_dir = args.output_dir
+    config.train.action_loss_weight = args.action_loss_weight
+    config.train.future_bev_loss_weight = args.future_bev_loss_weight
+    config.train.supervise_action_only = args.supervise_action_only
     config.model.load_in_4bit = args.load_in_4bit
     config.model.gradient_checkpointing = not args.no_gradient_checkpointing
 
@@ -134,6 +140,11 @@ def main() -> None:
     print(
         f"[model] load_in_4bit={config.model.load_in_4bit} "
         f"gradient_checkpointing={config.model.gradient_checkpointing}"
+    )
+    print(
+        f"[train] action_loss_weight={config.train.action_loss_weight} "
+        f"future_bev_loss_weight={config.train.future_bev_loss_weight} "
+        f"supervise_action_only={config.train.supervise_action_only}"
     )
 
     collator = UnifiedDriveCollator(
@@ -188,6 +199,9 @@ def main() -> None:
         "raw_dataset_size": len(full_dataset),
         "train_subset_size": len(train_dataset),
         "epoch_losses": epoch_losses,
+        "action_loss_weight": config.train.action_loss_weight,
+        "future_bev_loss_weight": config.train.future_bev_loss_weight,
+        "supervise_action_only": config.train.supervise_action_only,
         "reference_metadata": reference_sample.metadata,
         "gt_action_tokens": gt_action_tokens,
         "predicted_action_tokens": predicted_action_tokens,
