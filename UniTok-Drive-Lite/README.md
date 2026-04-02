@@ -8,7 +8,7 @@
 - 微调方式：LoRA only，冻结底模参数
 - 低显存路径：支持 4-bit 量化加载
 - 权威主链路：`scripts/` + `unitok_drive_lite/`
-- 数据：当前为合成 toy dataset，仅用于跑通主流程
+- 数据：支持合成 toy dataset 与最小 `nuScenes` 适配器
 
 ## 实现边界
 
@@ -78,7 +78,9 @@
 
 这是一个最小原型，不是完整自动驾驶栈，也不是可直接部署的系统。当前边界：
 
+- `UnifiedDrivingSample` 是当前最小主链路的统一样本格式
 - `ToyUnifiedDriveDataset` 是合成 toy 数据，只用于跑通主流程
+- `NuScenesUnifiedDriveDataset` 是最小适配器，不是 benchmark 级官方评测管线
 - planner 的 scorer 默认是启发式规则，不是 learned scorer
 - future BEV 离散化是最小实现，不是高保真世界模型
 - selective mask 在 `generate(...)` 路径可能退化为近似实现
@@ -137,6 +139,12 @@ WorldVLA/UniTok-Drive-Lite/
 pip install -r requirements.txt
 ```
 
+如果要使用 `nuScenes` 最小适配器，还需要额外安装官方 devkit：
+
+```bash
+pip install nuscenes-devkit
+```
+
 ### 低显存说明
 
 - Linux + CUDA 环境下可以使用 `bitsandbytes` 做 4-bit 量化
@@ -146,15 +154,20 @@ pip install -r requirements.txt
 
 ### 1. 最小训练闭环
 
-使用包内 toy dataset，跑通 `dataset -> discretizer -> model -> train_utils` 全链路：
+使用包内 dataset factory，跑通 `dataset -> discretizer -> model -> train_utils` 全链路：
 
 ```bash
-python3 scripts/train_minimal.py --dataset_size 8 --num_epochs 1
+python3 scripts/train_minimal.py --dataset_type toy --dataset_size 8 --num_epochs 1
 ```
 
 可选参数：
 
+- `--dataset_type`：数据源类型，支持 `toy` / `nuscenes`
 - `--dataset_size`：toy 数据集样本数（默认 8）
+- `--nuscenes_root`：nuScenes 数据根目录，仅 `dataset_type=nuscenes` 时必填
+- `--nuscenes_version`：nuScenes 版本，默认 `v1.0-mini`
+- `--nuscenes_split`：nuScenes split，默认 `mini_train`
+- `--max_samples`：限制 nuScenes 样本数，便于最小 smoke test
 - `--num_epochs`：训练轮数（默认 1）
 - `--output_dir`：checkpoint 保存路径（默认 `outputs/unitok_drive_lite`）
 
@@ -164,16 +177,49 @@ python3 scripts/train_minimal.py --dataset_size 8 --num_epochs 1
 outputs/unitok_drive_lite/checkpoint_last
 ```
 
+最小 `nuScenes` 训练示例：
+
+```bash
+python3 scripts/train_minimal.py \
+  --dataset_type nuscenes \
+  --nuscenes_root /path/to/nuscenes \
+  --nuscenes_version v1.0-mini \
+  --nuscenes_split mini_train \
+  --max_samples 2 \
+  --num_epochs 1
+```
+
 ### 2. 最小推理演示
 
 ```bash
-python3 scripts/run_demo.py --checkpoint_dir outputs/unitok_drive_lite/checkpoint_last
+python3 scripts/run_demo.py \
+  --dataset_type toy \
+  --checkpoint_dir outputs/unitok_drive_lite/checkpoint_last
 ```
 
 可选参数：
 
 - `--checkpoint_dir`：checkpoint 路径（默认 `outputs/unitok_drive_lite/checkpoint_last`）
-- `--sample_index`：选用第几个 toy 样本（默认 0）
+- `--dataset_type`：数据源类型，支持 `toy` / `nuscenes`
+- `--dataset_size`：toy demo 数据集大小，默认 `8`
+- `--nuscenes_root`：nuScenes 数据根目录，仅 `dataset_type=nuscenes` 时必填
+- `--nuscenes_version`：nuScenes 版本，默认 `v1.0-mini`
+- `--nuscenes_split`：nuScenes split，默认 `mini_train`
+- `--max_samples`：限制 nuScenes demo 可索引样本数
+- `--sample_index`：选用第几个样本（默认 0）
+
+最小 `nuScenes` demo 示例：
+
+```bash
+python3 scripts/run_demo.py \
+  --dataset_type nuscenes \
+  --checkpoint_dir outputs/unitok_drive_lite/checkpoint_last \
+  --nuscenes_root /path/to/nuscenes \
+  --nuscenes_version v1.0-mini \
+  --nuscenes_split mini_train \
+  --max_samples 2 \
+  --sample_index 0
+```
 
 ### 3. 两阶段 planner mock demo
 

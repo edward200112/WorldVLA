@@ -13,7 +13,7 @@ from .masking import TokenType
 from .token_registry import TokenRegistry
 
 if TYPE_CHECKING:
-    from .data import DriveSample
+    from .data import UnifiedDrivingSample
 
 
 @dataclass
@@ -269,7 +269,7 @@ class UnifiedDriveDiscretizer:
         labels.extend([-100] * len(text_ids))
         token_types.extend([int(TokenType.TEXT)] * len(text_ids))
 
-    def _build_vision_inputs(self, sample: DriveSample) -> tuple[torch.Tensor, torch.Tensor]:
+    def _build_vision_inputs(self, sample: UnifiedDrivingSample) -> tuple[torch.Tensor, torch.Tensor]:
         """把前视图和当前 BEV 渲染成 Emu3 image_processor 所需张量。"""
         images = [_to_pil_image(sample.front_image), _to_pil_image(sample.bev_now)]
         image_inputs = self.processor.image_processor(images=images, return_tensors="pt")
@@ -282,7 +282,7 @@ class UnifiedDriveDiscretizer:
             )
         return pixel_values, image_sizes
 
-    def build_training_sequence(self, sample: DriveSample) -> SequenceEncoding:
+    def build_training_sequence(self, sample: UnifiedDrivingSample) -> SequenceEncoding:
         """把一条 driving 样本组织成 Emu3 训练序列与视觉输入。"""
         prefix_ids, prefix_token_types = self._build_prefix_ids_and_types(sample.navigation_text)
         input_ids = list(prefix_ids)
@@ -334,7 +334,7 @@ class UnifiedDriveDiscretizer:
             image_sizes=image_sizes,
         )
 
-    def build_generation_queries(self, sample: DriveSample) -> SequenceEncoding:
+    def build_generation_queries(self, sample: UnifiedDrivingSample) -> SequenceEncoding:
         """构造推理时的一次性 query 序列。"""
         return self.build_training_sequence(sample)
 

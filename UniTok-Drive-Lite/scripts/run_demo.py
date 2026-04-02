@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from unitok_drive_lite import ToyUnifiedDriveDataset, UnifiedDriveModel, build_default_config
+from unitok_drive_lite import UnifiedDriveModel, build_dataset, build_default_config
 from unitok_drive_lite.train_utils import greedy_rollout, seed_everything
 
 
@@ -28,6 +28,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="outputs/unitok_drive_lite/checkpoint_last",
     )
+    parser.add_argument("--dataset_type", type=str, default="toy", choices=("toy", "nuscenes"))
+    parser.add_argument("--dataset_size", type=int, default=8)
+    parser.add_argument("--nuscenes_root", type=str, default=None)
+    parser.add_argument("--nuscenes_version", type=str, default="v1.0-mini")
+    parser.add_argument("--nuscenes_split", type=str, default="mini_train")
+    parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--sample_index", type=int, default=0)
     parser.add_argument("--load_in_4bit", action="store_true")
     return parser.parse_args()
@@ -46,19 +52,34 @@ def main() -> None:
     seed_everything(config.train.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    try:
+        dataset = build_dataset(
+            dataset_type=args.dataset_type,
+            token_config=config.tokens,
+            seed=config.train.seed,
+            dataset_size=max(args.dataset_size, args.sample_index + 1),
+            nuscenes_root=args.nuscenes_root,
+            nuscenes_version=args.nuscenes_version,
+            nuscenes_split=args.nuscenes_split,
+            max_samples=args.max_samples,
+        )
+    except (ImportError, FileNotFoundError, RuntimeError, ValueError) as error:
+        raise SystemExit(f"[data] {error}") from error
+
+    if args.sample_index < 0 or args.sample_index >= len(dataset):
+        raise SystemExit(
+            f"[data] sample_index={args.sample_index} 超出范围，当前 {args.dataset_type} 数据集大小为 {len(dataset)}"
+        )
+
     model = UnifiedDriveModel(config).to(device)
     model.load_checkpoint(checkpoint_dir)
     print(f"[model] backbone={config.model.model_name}")
     print(f"[model] load_in_4bit={config.model.load_in_4bit}")
 
-    dataset = ToyUnifiedDriveDataset(
-        size=max(args.sample_index + 1, 1),
-        token_config=config.tokens,
-        seed=config.train.seed,
-    )
     sample = dataset[args.sample_index]
     output = greedy_rollout(model, sample, device)
 
+    print(f"[data] dataset_type={args.dataset_type} sample_index={args.sample_index}")
     print("[input] navigation_text=", sample.navigation_text)
     print("[output] predicted_action_tokens=", output["predicted_action_tokens"])
     print("[output] predicted_trajectory=")

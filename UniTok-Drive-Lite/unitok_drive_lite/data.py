@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence
 
 import torch
@@ -11,8 +11,8 @@ from .discretizer import UnifiedDriveDiscretizer
 
 
 @dataclass
-class DriveSample:
-    """一条最小自动驾驶样本。"""
+class UnifiedDrivingSample:
+    """最小主链路的统一样本格式。"""
 
     front_image: torch.Tensor
     bev_now: torch.Tensor
@@ -20,6 +20,34 @@ class DriveSample:
     future_actions: torch.Tensor
     future_bevs: torch.Tensor
     navigation_text: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+# 兼容旧名称，避免主链路外的早期调用立刻断掉。
+DriveSample = UnifiedDrivingSample
+
+
+def rollout_future_bevs_from_actions(
+    bev_now: torch.Tensor,
+    future_actions: torch.Tensor,
+    token_config: TokenConfig,
+) -> torch.Tensor:
+    """根据未来动作粗略滚动出未来 BEV。"""
+    if future_actions.ndim != 2 or future_actions.shape[-1] != 2:
+        raise ValueError(
+            "future_actions 必须是形状为 [T_future, 2] 的张量，"
+            f"当前收到 {tuple(future_actions.shape)}"
+        )
+
+    frames: List[torch.Tensor] = []
+    for frame_index in range(token_config.future_bev_frames):
+        action = future_actions[min(frame_index, future_actions.shape[0] - 1)]
+        shift_y = int(torch.round(action[0]).item())
+        shift_x = int(torch.round(action[1]).item())
+        frame = torch.roll(bev_now, shifts=(shift_y, shift_x), dims=(1, 2))
+        attenuation = 1.0 - 0.08 * frame_index
+        frames.append((frame * attenuation).clamp(0.0, 1.0))
+    return torch.stack(frames, dim=0)
 
 
 class ToyUnifiedDriveDataset(Dataset):
@@ -27,6 +55,8 @@ class ToyUnifiedDriveDataset(Dataset):
 
     def __init__(self, size: int, token_config: TokenConfig, seed: int = 42) -> None:
         """初始化 toy 数据集。"""
+        if size <= 0:
+            raise ValueError(f"toy 数据集大小必须大于 0，当前收到 size={size}")
         self.size = size
         self.token_config = token_config
         self.seed = seed
@@ -82,31 +112,65 @@ class ToyUnifiedDriveDataset(Dataset):
             self.token_config.action_value_range,
         )
 
-    def _rollout_future_bevs(self, bev_now: torch.Tensor, future_actions: torch.Tensor) -> torch.Tensor:
-        """根据未来动作粗略滚动出未来 BEV。"""
-        frames: List[torch.Tensor] = []
-        for frame_index in range(self.token_config.future_bev_frames):
-            action = future_actions[min(frame_index, future_actions.shape[0] - 1)]
-            shift_y = int(torch.round(action[0]).item())
-            shift_x = int(torch.round(action[1]).item())
-            frame = torch.roll(bev_now, shifts=(shift_y, shift_x), dims=(1, 2))
-            attenuation = 1.0 - 0.08 * frame_index
-            frames.append((frame * attenuation).clamp(0.0, 1.0))
-        return torch.stack(frames, dim=0)
-
-    def __getitem__(self, index: int) -> DriveSample:
+    def __getitem__(self, index: int) -> UnifiedDrivingSample:
         """返回一条合成 driving 样本。"""
         generator = torch.Generator().manual_seed(self.seed + index)
         bev_now = self._make_base_bev(generator)
         future_actions = self._make_future_actions(generator)
-        return DriveSample(
+        return UnifiedDrivingSample(
             front_image=self._make_front_image(generator),
             bev_now=bev_now,
             history_actions=self._make_history_actions(generator),
             future_actions=future_actions,
-            future_bevs=self._rollout_future_bevs(bev_now, future_actions),
+            future_bevs=rollout_future_bevs_from_actions(
+                bev_now=bev_now,
+                future_actions=future_actions,
+                token_config=self.token_config,
+            ),
             navigation_text=self._build_navigation_text(index),
+            metadata={
+                "dataset_type": "toy",
+                "sample_index": index,
+                "seed": self.seed,
+            },
         )
+
+
+def build_dataset(
+    dataset_type: str,
+    token_config: TokenConfig,
+    seed: int = 42,
+    dataset_size: int | None = None,
+    nuscenes_root: str | None = None,
+    nuscenes_version: str = "v1.0-mini",
+    nuscenes_split: str = "mini_train",
+    max_samples: int | None = None,
+) -> Dataset:
+    """按数据源类型创建最小主链路数据集。"""
+    normalized_dataset_type = dataset_type.strip().lower()
+    if normalized_dataset_type == "toy":
+        toy_size = dataset_size if dataset_size is not None else 8
+        return ToyUnifiedDriveDataset(
+            size=toy_size,
+            token_config=token_config,
+            seed=seed,
+        )
+
+    if normalized_dataset_type == "nuscenes":
+        if not nuscenes_root:
+            raise ValueError("使用 nuScenes 数据集时必须提供 --nuscenes_root。")
+        from .nuscenes_adapter import NuScenesUnifiedDriveDataset
+
+        return NuScenesUnifiedDriveDataset(
+            root=nuscenes_root,
+            version=nuscenes_version,
+            split=nuscenes_split,
+            token_config=token_config,
+            max_samples=max_samples,
+            seed=seed,
+        )
+
+    raise ValueError(f"不支持的数据集类型: {dataset_type}，可选值为 toy 或 nuscenes。")
 
 
 class UnifiedDriveCollator:
@@ -123,7 +187,7 @@ class UnifiedDriveCollator:
         padded = [value + [pad_value] * (max_length - len(value)) for value in values]
         return torch.tensor(padded, dtype=torch.long)
 
-    def __call__(self, samples: Sequence[DriveSample]) -> Dict[str, Any]:
+    def __call__(self, samples: Sequence[UnifiedDrivingSample]) -> Dict[str, Any]:
         """把一批样本编码成模型输入。"""
         encodings = [self.discretizer.build_training_sequence(sample) for sample in samples]
         input_ids = self._pad_sequences([encoding.input_ids for encoding in encodings], self.pad_token_id)

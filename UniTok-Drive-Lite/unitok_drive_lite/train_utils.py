@@ -10,7 +10,7 @@ import torch
 from torch.optim import AdamW
 
 from .config import ExperimentConfig
-from .data import DriveSample
+from .data import UnifiedDrivingSample
 from .model import UnifiedDriveModel
 
 
@@ -115,7 +115,7 @@ def _decode_positions_from_logits(
 @torch.no_grad()
 def greedy_rollout(
     model: UnifiedDriveModel,
-    sample: DriveSample,
+    sample: UnifiedDrivingSample,
     device: torch.device,
 ) -> Dict[str, Any]:
     """按固定结构贪心生成 future action 和未来 3 帧 BEV。"""
