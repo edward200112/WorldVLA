@@ -20,9 +20,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from unitok_drive_lite import (
     UnifiedDriveCollator,
     UnifiedDriveModel,
-    build_dataset,
     build_default_config,
 )
+from unitok_drive_lite.script_utils import add_dataset_selection_args, build_dataset_from_args
 from unitok_drive_lite.train_utils import (
     build_optimizer,
     greedy_rollout,
@@ -35,12 +35,7 @@ from unitok_drive_lite.train_utils import (
 def parse_args() -> argparse.Namespace:
     """解析最小训练脚本参数。"""
     parser = argparse.ArgumentParser(description="训练最小版 UniTok-Drive-Lite Emu3 主干。")
-    parser.add_argument("--dataset_type", type=str, default="toy", choices=("toy", "nuscenes"))
-    parser.add_argument("--dataset_size", type=int, default=8)
-    parser.add_argument("--nuscenes_root", type=str, default=None)
-    parser.add_argument("--nuscenes_version", type=str, default="v1.0-mini")
-    parser.add_argument("--nuscenes_split", type=str, default="mini_train")
-    parser.add_argument("--max_samples", type=int, default=None)
+    add_dataset_selection_args(parser)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--output_dir", type=str, default="outputs/unitok_drive_lite")
     parser.add_argument("--load_in_4bit", action="store_true")
@@ -62,15 +57,10 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     try:
-        dataset = build_dataset(
-            dataset_type=args.dataset_type,
+        dataset = build_dataset_from_args(
+            args=args,
             token_config=config.tokens,
             seed=config.train.seed,
-            dataset_size=args.dataset_size,
-            nuscenes_root=args.nuscenes_root,
-            nuscenes_version=args.nuscenes_version,
-            nuscenes_split=args.nuscenes_split,
-            max_samples=args.max_samples,
         )
     except (ImportError, FileNotFoundError, RuntimeError, ValueError) as error:
         raise SystemExit(f"[data] {error}") from error

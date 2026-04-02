@@ -9,6 +9,7 @@
 - 低显存路径：支持 4-bit 量化加载
 - 权威主链路：`scripts/` + `unitok_drive_lite/`
 - 数据：支持合成 toy dataset 与最小 `nuScenes` 适配器
+- 验证工具：提供最小 overfit 与 action 分布分析脚本
 
 ## 实现边界
 
@@ -81,6 +82,7 @@
 - `UnifiedDrivingSample` 是当前最小主链路的统一样本格式
 - `ToyUnifiedDriveDataset` 是合成 toy 数据，只用于跑通主流程
 - `NuScenesUnifiedDriveDataset` 是最小适配器，不是 benchmark 级官方评测管线
+  当前实现使用 `CAM_FRONT`、ego pose 近似动作目标，以及“当前 BEV + future action”的简化 future BEV rollout
 - planner 的 scorer 默认是启发式规则，不是 learned scorer
 - future BEV 离散化是最小实现，不是高保真世界模型
 - selective mask 在 `generate(...)` 路径可能退化为近似实现
@@ -221,7 +223,61 @@ python3 scripts/run_demo.py \
   --sample_index 0
 ```
 
-### 3. 两阶段 planner mock demo
+### 3. 最小 overfit 验证
+
+用于检查模型能否在极小 toy / nuScenes 子集上快速记住监督目标：
+
+```bash
+python3 scripts/validate_overfit_minimal.py \
+  --dataset_type toy \
+  --dataset_size 4 \
+  --max_train_samples 2 \
+  --num_epochs 3
+```
+
+nuScenes 示例：
+
+```bash
+python3 scripts/validate_overfit_minimal.py \
+  --dataset_type nuscenes \
+  --nuscenes_root /path/to/nuscenes \
+  --nuscenes_version v1.0-mini \
+  --nuscenes_split mini_train \
+  --max_samples 8 \
+  --max_train_samples 4 \
+  --focus_scene_token <scene_token> \
+  --num_epochs 3
+```
+
+### 4. Action 分布分析
+
+用于检查 greedy rollout 的 action token 是否塌缩到极少数 id：
+
+```bash
+python3 scripts/analyze_action_distribution.py \
+  --checkpoint_dir outputs/unitok_drive_lite/checkpoint_last \
+  --dataset_type toy \
+  --dataset_size 8 \
+  --max_eval_samples 8 \
+  --output_json outputs/unitok_drive_lite/action_distribution_summary.json
+```
+
+nuScenes 示例：
+
+```bash
+python3 scripts/analyze_action_distribution.py \
+  --checkpoint_dir outputs/unitok_drive_lite/checkpoint_last \
+  --dataset_type nuscenes \
+  --nuscenes_root /path/to/nuscenes \
+  --nuscenes_version v1.0-mini \
+  --nuscenes_split mini_train \
+  --max_samples 16 \
+  --max_eval_samples 8 \
+  --sample_stride 2 \
+  --output_json outputs/unitok_drive_lite/nuscenes_action_distribution.json
+```
+
+### 5. 两阶段 planner mock demo
 
 不依赖真实 Emu3 权重，可直接跑通 "动作候选 -> future BEV rollout -> 打分 -> 轨迹解码"：
 
@@ -229,7 +285,7 @@ python3 scripts/run_demo.py \
 python3 infer/planner.py
 ```
 
-### 4. 自定义 SFT 训练脚本
+### 6. 自定义 SFT 训练脚本
 
 如果你已经有自己的样本文件，可以使用顶层实验目录中的手写训练循环版本：
 

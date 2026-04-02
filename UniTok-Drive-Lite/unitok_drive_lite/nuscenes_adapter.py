@@ -45,6 +45,7 @@ class NuScenesUnifiedDriveDataset(Dataset):
         split: str = "mini_train",
         token_config: TokenConfig | None = None,
         max_samples: int | None = None,
+        focus_scene_token: str | None = None,
         seed: int = 42,
     ) -> None:
         if token_config is None:
@@ -55,6 +56,7 @@ class NuScenesUnifiedDriveDataset(Dataset):
         self.split = split
         self.token_config = token_config
         self.max_samples = max_samples
+        self.focus_scene_token = focus_scene_token
         self.seed = seed
 
         self.forward_extent_m = 25.0
@@ -69,10 +71,14 @@ class NuScenesUnifiedDriveDataset(Dataset):
         self.pose_cache: dict[str, EgoPose2D] = {}
 
         if not self.sample_descriptors:
+            focus_scene_message = ""
+            if self.focus_scene_token:
+                focus_scene_message = f" focus_scene_token={self.focus_scene_token}"
             raise RuntimeError(
                 "未找到可用的 nuScenes 样本。请检查 "
                 f"--nuscenes_root={self.root} --nuscenes_version={self.version} "
-                f"--nuscenes_split={self.split} 是否匹配，并确认数据集中存在 CAM_FRONT 图像。"
+                f"--nuscenes_split={self.split}{focus_scene_message} 是否匹配，"
+                "并确认数据集中存在 CAM_FRONT 图像。"
             )
 
     def _validate_root(self) -> None:
@@ -131,6 +137,8 @@ class NuScenesUnifiedDriveDataset(Dataset):
         descriptors: List[NuScenesSampleDescriptor] = []
         for scene_record in self.nusc.scene:
             if scene_record["name"] not in allowed_scene_names:
+                continue
+            if self.focus_scene_token and scene_record["token"] != self.focus_scene_token:
                 continue
 
             sample_token = scene_record["first_sample_token"]
@@ -395,6 +403,7 @@ class NuScenesUnifiedDriveDataset(Dataset):
             future_bevs=future_bevs,
             navigation_text=navigation_text,
             metadata={
+                "source": "nuscenes",
                 "dataset_type": "nuscenes",
                 "adapter": "NuScenesUnifiedDriveDataset",
                 "version": self.version,
@@ -404,5 +413,6 @@ class NuScenesUnifiedDriveDataset(Dataset):
                 "sample_token": descriptor.sample_token,
                 "timestamp": sample_record["timestamp"],
                 "motion_normalization_m": self.motion_normalization_m,
+                "focus_scene_token": self.focus_scene_token,
             },
         )

@@ -16,7 +16,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from unitok_drive_lite import UnifiedDriveModel, build_dataset, build_default_config
+from unitok_drive_lite import UnifiedDriveModel, build_default_config
+from unitok_drive_lite.script_utils import add_dataset_selection_args, build_dataset_from_args
 from unitok_drive_lite.train_utils import greedy_rollout, seed_everything
 
 
@@ -28,12 +29,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="outputs/unitok_drive_lite/checkpoint_last",
     )
-    parser.add_argument("--dataset_type", type=str, default="toy", choices=("toy", "nuscenes"))
-    parser.add_argument("--dataset_size", type=int, default=8)
-    parser.add_argument("--nuscenes_root", type=str, default=None)
-    parser.add_argument("--nuscenes_version", type=str, default="v1.0-mini")
-    parser.add_argument("--nuscenes_split", type=str, default="mini_train")
-    parser.add_argument("--max_samples", type=int, default=None)
+    add_dataset_selection_args(parser)
     parser.add_argument("--sample_index", type=int, default=0)
     parser.add_argument("--load_in_4bit", action="store_true")
     return parser.parse_args()
@@ -53,15 +49,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     try:
-        dataset = build_dataset(
-            dataset_type=args.dataset_type,
+        dataset = build_dataset_from_args(
+            args=args,
             token_config=config.tokens,
             seed=config.train.seed,
             dataset_size=max(args.dataset_size, args.sample_index + 1),
-            nuscenes_root=args.nuscenes_root,
-            nuscenes_version=args.nuscenes_version,
-            nuscenes_split=args.nuscenes_split,
-            max_samples=args.max_samples,
         )
     except (ImportError, FileNotFoundError, RuntimeError, ValueError) as error:
         raise SystemExit(f"[data] {error}") from error

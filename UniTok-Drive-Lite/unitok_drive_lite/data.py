@@ -129,6 +129,7 @@ class ToyUnifiedDriveDataset(Dataset):
             ),
             navigation_text=self._build_navigation_text(index),
             metadata={
+                "source": "toy",
                 "dataset_type": "toy",
                 "sample_index": index,
                 "seed": self.seed,
@@ -145,6 +146,7 @@ def build_dataset(
     nuscenes_version: str = "v1.0-mini",
     nuscenes_split: str = "mini_train",
     max_samples: int | None = None,
+    focus_scene_token: str | None = None,
 ) -> Dataset:
     """按数据源类型创建最小主链路数据集。"""
     normalized_dataset_type = dataset_type.strip().lower()
@@ -167,6 +169,7 @@ def build_dataset(
             split=nuscenes_split,
             token_config=token_config,
             max_samples=max_samples,
+            focus_scene_token=focus_scene_token,
             seed=seed,
         )
 
