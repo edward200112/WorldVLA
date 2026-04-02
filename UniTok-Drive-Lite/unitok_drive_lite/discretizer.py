@@ -16,6 +16,10 @@ if TYPE_CHECKING:
     from .data import UnifiedDrivingSample
 
 
+ACTION_DIM_NAMES: tuple[str, str] = ("longitudinal", "lateral")
+ACTION_DIM_TO_INDEX = {name: index for index, name in enumerate(ACTION_DIM_NAMES)}
+
+
 @dataclass
 class UnifiedTokenLayout:
     """保存统一 token 空间里各类 token 的实际 id。"""
@@ -39,6 +43,7 @@ class SequenceEncoding:
     future_bev_query_positions: List[List[int]]
     pixel_values: torch.Tensor
     image_sizes: torch.Tensor
+
 
 def build_global_special_tokens(config: TokenConfig) -> List[str]:
     """兼容旧调用方式，返回 registry 里统一维护的全部 special tokens。"""
@@ -88,6 +93,7 @@ class UnifiedDriveDiscretizer:
         self._validate_config()
         self.layout = self._build_layout()
         self.image_placeholder_id = self._resolve_image_placeholder_id()
+        self.action_bin_centers = self._build_action_bin_centers()
 
         self.action_token_to_index = {
             token_id: index for index, token_id in enumerate(self.layout.action_token_ids)
@@ -107,6 +113,86 @@ class UnifiedDriveDiscretizer:
             raise ValueError("image_size 必须能被 image_patch_size 整除。")
         if bev_height % self.config.bev_patch_size != 0 or bev_width % self.config.bev_patch_size != 0:
             raise ValueError("bev_size 必须能被 bev_patch_size 整除。")
+        if self.config.action_bins_per_dim < 2:
+            raise ValueError("action_bins_per_dim 至少需要为 2。")
+        if self.config.action_zero_deadband < 0.0:
+            raise ValueError("action_zero_deadband 不能为负数。")
+        if self.config.action_zero_deadband >= self.config.action_value_range:
+            raise ValueError("action_zero_deadband 必须小于 action_value_range。")
+        if self.config.action_lateral_near_zero_threshold < 0.0:
+            raise ValueError("action_lateral_near_zero_threshold 不能为负数。")
+        for dim_name in ACTION_DIM_NAMES:
+            mode = self._resolve_action_quantization_mode(dim_name)
+            if mode not in {"uniform_with_deadband", "nonuniform_zero_dense"}:
+                raise ValueError(f"不支持的 {dim_name} action_quantization_mode: {mode}")
+            if self._resolve_zero_dense_power(dim_name) <= 0.0:
+                raise ValueError(f"{dim_name} zero_dense_power 必须大于 0。")
+
+    def _resolve_action_quantization_mode(self, dim_name: str) -> str:
+        """解析某个动作维度当前使用的量化模式。"""
+        override = getattr(self.config, f"action_{dim_name}_quantization_mode", None)
+        if override is not None:
+            return str(override)
+        return str(self.config.action_quantization_mode)
+
+    def _resolve_zero_dense_power(self, dim_name: str) -> float:
+        """解析 zero-dense 模式下某个维度的中心密度系数。"""
+        return float(getattr(self.config, f"action_{dim_name}_zero_dense_power"))
+
+    def _build_action_side_magnitudes(self, count: int, dim_name: str) -> torch.Tensor:
+        """构造单侧动作中心的绝对值列表。
+
+        即使 token 数固定为偶数，这里仍显式保留一个 0 center，再把剩余中心非均匀地
+        分配到两侧。这样做的目标是优先让 near-zero lateral 拥有稳定、可解释的离散语义，
+        而不是继续沿用均匀 8 bin 在 0 附近来回跳的行为。
+        """
+        if count <= 0:
+            return torch.empty(0, dtype=torch.float32)
+
+        deadband = float(self.config.action_zero_deadband)
+        value_range = float(self.config.action_value_range)
+        normalized_positions = torch.linspace(0.0, 1.0, steps=count + 1, dtype=torch.float32)[1:]
+        mode = self._resolve_action_quantization_mode(dim_name)
+        if mode == "uniform_with_deadband":
+            warped_positions = normalized_positions
+        else:
+            warped_positions = normalized_positions.pow(self._resolve_zero_dense_power(dim_name))
+
+        magnitudes = deadband + warped_positions * (value_range - deadband)
+        magnitudes[-1] = value_range
+        return magnitudes
+
+    def _build_action_dim_centers(self, dim_name: str) -> torch.Tensor:
+        """构造某个动作维度的离散中心。"""
+        bins_per_dim = self.config.action_bins_per_dim
+        zero_bin_index = bins_per_dim // 2
+        negative_count = zero_bin_index
+        positive_count = bins_per_dim - zero_bin_index - 1
+
+        negative_magnitudes = self._build_action_side_magnitudes(negative_count, dim_name)
+        positive_magnitudes = self._build_action_side_magnitudes(positive_count, dim_name)
+        negative_centers = -torch.flip(negative_magnitudes, dims=[0])
+        positive_centers = positive_magnitudes
+        centers = torch.cat(
+            [
+                negative_centers,
+                torch.tensor([0.0], dtype=torch.float32),
+                positive_centers,
+            ],
+            dim=0,
+        )
+        if centers.numel() != bins_per_dim:
+            raise RuntimeError(
+                f"{dim_name} action center 数量不正确: expected={bins_per_dim} actual={centers.numel()}"
+            )
+        return centers
+
+    def _build_action_bin_centers(self) -> torch.Tensor:
+        """构造 [2, bins_per_dim] 的 per-dim action center 表。"""
+        return torch.stack(
+            [self._build_action_dim_centers(dim_name) for dim_name in ACTION_DIM_NAMES],
+            dim=0,
+        )
 
     def _resolve_token_id(self, token: str) -> int:
         """把 special token 字符串解析成稳定的 token id。"""
@@ -218,37 +304,83 @@ class UnifiedDriveDiscretizer:
         flat_index = discrete[:, 0] * bins_per_dim + discrete[:, 1]
         return [token_ids[index] for index in flat_index.tolist()]
 
-    def _build_action_bin_centers(self) -> torch.Tensor:
-        """构造 future action 的每维离散中心。
-
-        当前最小原型里，nuScenes 的 lateral 真实值大量落在 0 附近。
-        如果直接用偶数个均匀 bin，零附近没有真正的 zero bin，会把极小扰动
-        强行压到正负两侧相邻 token。这里保留原有 token 数，只把一个近零 bin
-        显式改成 0.0，并配合 deadband 提升 target fidelity。
-        """
-        bins_per_dim = self.config.action_bins_per_dim
-        centers = torch.linspace(
-            -self.config.action_value_range,
-            self.config.action_value_range,
-            steps=bins_per_dim,
-            dtype=torch.float32,
-        )
-        zero_bin_index = bins_per_dim // 2
-        centers[zero_bin_index] = 0.0
-        return centers
-
-    def _quantize_future_action_vectors(self, vectors: torch.Tensor) -> List[int]:
-        """把 future action 量化到固定 token，零附近使用 deadband。"""
-        centers = self._build_action_bin_centers().to(device=vectors.device)
+    def _prepare_future_action_vectors(self, vectors: torch.Tensor) -> torch.Tensor:
+        """对 future action 做统一裁剪和 zero-deadband 预处理。"""
         clipped = vectors.clamp(-self.config.action_value_range, self.config.action_value_range).to(torch.float32)
         if self.config.action_zero_deadband > 0.0:
             clipped = clipped.clone()
             clipped[clipped.abs() <= float(self.config.action_zero_deadband)] = 0.0
+        return clipped
 
-        distances = (clipped.unsqueeze(-1) - centers.view(1, 1, -1)).abs()
-        discrete = torch.argmin(distances, dim=-1).to(torch.long)
+    def quantize_future_action_bin_indices(self, vectors: torch.Tensor) -> torch.Tensor:
+        """把 future action 量化为每个维度的离散 bin index。"""
+        clipped = self._prepare_future_action_vectors(vectors)
+        centers = self.action_bin_centers.to(device=clipped.device, dtype=clipped.dtype)
+        distances = (clipped.unsqueeze(-1) - centers.unsqueeze(0)).abs()
+        return torch.argmin(distances, dim=-1).to(torch.long)
+
+    def _quantize_future_action_vectors(self, vectors: torch.Tensor) -> List[int]:
+        """把 future action 量化到固定 joint action token。"""
+        discrete = self.quantize_future_action_bin_indices(vectors)
         flat_index = discrete[:, 0] * self.config.action_bins_per_dim + discrete[:, 1]
         return [self.layout.action_token_ids[index] for index in flat_index.tolist()]
+
+    def decode_action_bin_indices(self, bin_indices: torch.Tensor) -> torch.Tensor:
+        """把每维 bin index 还原成连续动作增量。"""
+        indices_cpu = bin_indices.detach().cpu().to(torch.long)
+        decoded = torch.empty(indices_cpu.shape, dtype=torch.float32)
+        for dim_name, dim_index in ACTION_DIM_TO_INDEX.items():
+            decoded[:, dim_index] = self.action_bin_centers[dim_index, indices_cpu[:, dim_index]]
+        return decoded
+
+    def decode_action_token_id_to_bins(self, token_id: int) -> Dict[str, int]:
+        """把 joint action token 解析成各维 bin index。"""
+        flat_index = self.action_token_to_index[int(token_id)]
+        bins_per_dim = self.config.action_bins_per_dim
+        return {
+            "longitudinal": int(flat_index // bins_per_dim),
+            "lateral": int(flat_index % bins_per_dim),
+        }
+
+    def get_action_quantization_summary(self) -> Dict[str, Any]:
+        """返回 action token 量化语义摘要，供日志和 checkpoint 使用。"""
+        return {
+            "action_bins_per_dim": int(self.config.action_bins_per_dim),
+            "action_value_range": float(self.config.action_value_range),
+            "action_zero_deadband": float(self.config.action_zero_deadband),
+            "default_mode": str(self.config.action_quantization_mode),
+            "lateral_near_zero_threshold": float(self.config.action_lateral_near_zero_threshold),
+            "per_dim": {
+                dim_name: {
+                    "mode": self._resolve_action_quantization_mode(dim_name),
+                    "zero_dense_power": float(self._resolve_zero_dense_power(dim_name)),
+                    "centers": [
+                        float(value)
+                        for value in self.action_bin_centers[ACTION_DIM_TO_INDEX[dim_name]].tolist()
+                    ],
+                }
+                for dim_name in ACTION_DIM_NAMES
+            },
+        }
+
+    def get_action_quantization_signature(self) -> Dict[str, Any]:
+        """返回稳定的量化签名，用于 checkpoint 兼容性校验。"""
+        summary = self.get_action_quantization_summary()
+        return {
+            "action_bins_per_dim": summary["action_bins_per_dim"],
+            "action_value_range": round(summary["action_value_range"], 6),
+            "action_zero_deadband": round(summary["action_zero_deadband"], 6),
+            "default_mode": summary["default_mode"],
+            "lateral_near_zero_threshold": round(summary["lateral_near_zero_threshold"], 6),
+            "per_dim": {
+                dim_name: {
+                    "mode": dim_summary["mode"],
+                    "zero_dense_power": round(dim_summary["zero_dense_power"], 6),
+                    "centers": [round(float(value), 6) for value in dim_summary["centers"]],
+                }
+                for dim_name, dim_summary in summary["per_dim"].items()
+            },
+        }
 
     def encode_bev(self, bev: torch.Tensor) -> List[int]:
         """把一帧 BEV 编码成固定全局 BEV token。"""
@@ -368,19 +500,19 @@ class UnifiedDriveDiscretizer:
 
     def decode_action_token_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
         """把 raw action token 还原为连续动作增量。"""
-        vectors: List[List[float]] = []
         bins_per_dim = self.config.action_bins_per_dim
-        centers = self._build_action_bin_centers()
+        bin_indices: List[List[int]] = []
         for token_id in token_ids:
             flat_index = self.action_token_to_index[token_id]
-            x_bin = flat_index // bins_per_dim
-            y_bin = flat_index % bins_per_dim
-            continuous = torch.tensor(
-                [centers[x_bin].item(), centers[y_bin].item()],
-                dtype=torch.float32,
+            bin_indices.append(
+                [
+                    int(flat_index // bins_per_dim),
+                    int(flat_index % bins_per_dim),
+                ]
             )
-            vectors.append(continuous.tolist())
-        return torch.tensor(vectors, dtype=torch.float32)
+        if not bin_indices:
+            return torch.empty((0, len(ACTION_DIM_NAMES)), dtype=torch.float32)
+        return self.decode_action_bin_indices(torch.tensor(bin_indices, dtype=torch.long))
 
     def decode_action_tokens_to_trajectory(self, token_ids: Sequence[int]) -> torch.Tensor:
         """把动作 token 累积成连续轨迹。"""

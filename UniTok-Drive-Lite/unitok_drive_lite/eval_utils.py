@@ -6,6 +6,9 @@ from typing import Any, Dict, Iterable, Sequence
 
 import torch
 
+ACTION_DIM_NAMES: tuple[str, str] = ("longitudinal", "lateral")
+ACTION_DIM_TO_INDEX = {name: index for index, name in enumerate(ACTION_DIM_NAMES)}
+
 
 def tensor_to_list(value: torch.Tensor) -> list[Any]:
     """把 tensor 安全转成 Python 列表。"""
@@ -72,16 +75,111 @@ def trajectory_stats(predicted: torch.Tensor, target: torch.Tensor) -> Dict[str,
         )
 
     difference = predicted_cpu - target_cpu
+    absolute_difference = difference.abs()
     final_delta = predicted_cpu[-1] - target_cpu[-1]
-    return {
+    summary = {
         "predicted_shape": list(predicted_cpu.shape),
         "target_shape": list(target_cpu.shape),
-        "mean_abs_error": float(difference.abs().mean().item()),
-        "max_abs_error": float(difference.abs().max().item()),
+        "mean_abs_error": float(absolute_difference.mean().item()),
+        "max_abs_error": float(absolute_difference.max().item()),
         "final_step_l2": float(torch.linalg.vector_norm(final_delta).item()),
         "predicted_final_point": tensor_to_list(predicted_cpu[-1]),
         "target_final_point": tensor_to_list(target_cpu[-1]),
     }
+    if predicted_cpu.ndim >= 2 and predicted_cpu.shape[-1] >= len(ACTION_DIM_NAMES):
+        for dim_name, dim_index in ACTION_DIM_TO_INDEX.items():
+            summary[f"{dim_name}_mean_abs_error"] = float(absolute_difference[:, dim_index].mean().item())
+            summary[f"{dim_name}_final_step_abs_error"] = float(final_delta[dim_index].abs().item())
+    return summary
+
+
+def summarize_scalar_distribution(
+    values: torch.Tensor,
+    *,
+    near_zero_threshold: float | None = None,
+) -> Dict[str, Any]:
+    """返回一维连续值分布的摘要。"""
+    values_cpu = values.detach().cpu().to(torch.float32).flatten()
+    if values_cpu.numel() == 0:
+        summary = {
+            "count": 0,
+            "mean": 0.0,
+            "std": 0.0,
+            "abs_mean": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "p05": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+        }
+    else:
+        summary = {
+            "count": int(values_cpu.numel()),
+            "mean": float(values_cpu.mean().item()),
+            "std": float(values_cpu.std(unbiased=False).item()),
+            "abs_mean": float(values_cpu.abs().mean().item()),
+            "min": float(values_cpu.min().item()),
+            "max": float(values_cpu.max().item()),
+            "p05": float(torch.quantile(values_cpu, 0.05).item()),
+            "p50": float(torch.quantile(values_cpu, 0.50).item()),
+            "p95": float(torch.quantile(values_cpu, 0.95).item()),
+        }
+
+    if near_zero_threshold is not None:
+        if values_cpu.numel() == 0:
+            near_zero_mask = torch.zeros_like(values_cpu, dtype=torch.bool)
+        else:
+            near_zero_mask = values_cpu.abs().le(float(near_zero_threshold))
+        summary.update(
+            {
+                "near_zero_threshold": float(near_zero_threshold),
+                "near_zero_count": int(near_zero_mask.sum().item()),
+                "near_zero_ratio": float(near_zero_mask.float().mean().item()) if values_cpu.numel() > 0 else 0.0,
+            }
+        )
+    return summary
+
+
+def quantization_trajectory_stats(
+    quantized_trajectory: torch.Tensor,
+    raw_trajectory: torch.Tensor,
+    *,
+    near_zero_lateral_threshold: float,
+) -> Dict[str, Any]:
+    """统计 raw -> quantized 轨迹误差，重点检查 near-zero lateral 是否被扭坏。"""
+    summary = trajectory_stats(quantized_trajectory, raw_trajectory)
+    raw_cpu = raw_trajectory.detach().cpu().to(torch.float32)
+    quantized_cpu = quantized_trajectory.detach().cpu().to(torch.float32)
+    if raw_cpu.shape != quantized_cpu.shape:
+        raise ValueError(
+            "raw trajectory 与 quantized trajectory shape 不一致: "
+            f"raw={tuple(raw_cpu.shape)} quantized={tuple(quantized_cpu.shape)}"
+        )
+    if raw_cpu.ndim != 2 or raw_cpu.shape[-1] < 2:
+        raise ValueError(f"动作轨迹必须是 [T, 2]，当前收到 {tuple(raw_cpu.shape)}")
+
+    raw_lateral = raw_cpu[:, ACTION_DIM_TO_INDEX["lateral"]]
+    quantized_lateral = quantized_cpu[:, ACTION_DIM_TO_INDEX["lateral"]]
+    near_zero_mask = raw_lateral.abs().le(float(near_zero_lateral_threshold))
+    sign_flip_mask = raw_lateral * quantized_lateral < 0.0
+
+    near_zero_count = int(near_zero_mask.sum().item())
+    summary.update(
+        {
+            "near_zero_lateral_threshold": float(near_zero_lateral_threshold),
+            "near_zero_lateral_step_count": near_zero_count,
+            "near_zero_lateral_step_ratio": float(near_zero_mask.float().mean().item()),
+            "lateral_sign_flip_count": int(sign_flip_mask.sum().item()),
+            "lateral_sign_flip_ratio": float(sign_flip_mask.float().mean().item()),
+            "near_zero_lateral_sign_flip_count": int((sign_flip_mask & near_zero_mask).sum().item()),
+            "near_zero_lateral_sign_flip_ratio": (
+                float((sign_flip_mask & near_zero_mask).sum().item() / near_zero_count)
+                if near_zero_count > 0
+                else 0.0
+            ),
+        }
+    )
+    return summary
 
 
 def bev_occupancy_stats(bev: torch.Tensor) -> Dict[str, Any]:

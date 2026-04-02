@@ -22,7 +22,13 @@ from unitok_drive_lite import (
     UnifiedDriveModel,
     build_default_config,
 )
-from unitok_drive_lite.script_utils import add_dataset_selection_args, build_dataset_from_args
+from unitok_drive_lite.script_utils import (
+    add_action_quantization_args,
+    add_dataset_selection_args,
+    apply_action_quantization_args,
+    build_dataset_from_args,
+    print_action_quantization_summary,
+)
 from unitok_drive_lite.train_utils import (
     build_optimizer,
     greedy_rollout,
@@ -36,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     """解析最小训练脚本参数。"""
     parser = argparse.ArgumentParser(description="训练最小版 UniTok-Drive-Lite Emu3 主干。")
     add_dataset_selection_args(parser)
+    add_action_quantization_args(parser)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--output_dir", type=str, default="outputs/unitok_drive_lite")
     parser.add_argument("--action_loss_weight", type=float, default=6.0)
@@ -58,6 +65,7 @@ def main() -> None:
     config.train.supervise_action_only = args.supervise_action_only
     config.model.load_in_4bit = args.load_in_4bit
     config.model.gradient_checkpointing = not args.no_gradient_checkpointing
+    apply_action_quantization_args(config.tokens, args)
 
     seed_everything(config.train.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -85,6 +93,7 @@ def main() -> None:
         f"future_bev_loss_weight={config.train.future_bev_loss_weight} "
         f"supervise_action_only={config.train.supervise_action_only}"
     )
+    print_action_quantization_summary(model.discretizer.get_action_quantization_summary())
     total_parameters, trainable_parameters = model.count_trainable_parameters()
     print(f"[model] total_parameters={total_parameters:,}")
     print(f"[model] trainable_parameters={trainable_parameters:,}")

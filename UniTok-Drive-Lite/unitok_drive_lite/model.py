@@ -757,6 +757,8 @@ class UnifiedDriveModel(nn.Module):
             },
             "trainable_non_lora": trainable_non_lora,
             "trainable_token_start": self.trainable_token_start,
+            "action_quantization_summary": self.discretizer.get_action_quantization_summary(),
+            "action_quantization_signature": self.discretizer.get_action_quantization_signature(),
         }
 
     def save_checkpoint(self, checkpoint_dir: Path) -> None:
@@ -770,6 +772,31 @@ class UnifiedDriveModel(nn.Module):
         """加载最小检查点。"""
         checkpoint_path = checkpoint_dir / "adapter_state.pt"
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        self.last_checkpoint_quantization_warning: str | None = None
+
+        saved_signature = checkpoint.get("action_quantization_signature")
+        current_signature = self.discretizer.get_action_quantization_signature()
+        if saved_signature is None:
+            warning_message = (
+                "checkpoint 中缺少 action quantization metadata。"
+                "这通常意味着它是在旧 action token 语义下训练出来的，"
+                "不能与当前量化配置静默混用。"
+            )
+            print(f"[warning] {warning_message}")
+            warnings.warn(warning_message, stacklevel=2)
+            self.last_checkpoint_quantization_warning = warning_message
+        elif saved_signature != current_signature:
+            warning_message = (
+                "checkpoint 的 action quantization signature 与当前配置不一致。"
+                "当前权重对应的 action token 语义可能已经变化，请重新 overfit / 重新训练，"
+                "不要直接横向比较旧 checkpoint。"
+            )
+            print(f"[warning] {warning_message}")
+            print(f"[warning] saved_action_quantization={checkpoint.get('action_quantization_summary')}")
+            print(f"[warning] current_action_quantization={self.discretizer.get_action_quantization_summary()}")
+            warnings.warn(warning_message, stacklevel=2)
+            self.last_checkpoint_quantization_warning = warning_message
+
         lora_state = checkpoint.get("lora", checkpoint)
         self.backbone.load_state_dict(lora_state, strict=False)
 

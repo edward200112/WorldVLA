@@ -17,7 +17,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from unitok_drive_lite import UnifiedDriveModel, build_default_config
-from unitok_drive_lite.script_utils import add_dataset_selection_args, build_dataset_from_args
+from unitok_drive_lite.script_utils import (
+    add_action_quantization_args,
+    add_dataset_selection_args,
+    apply_action_quantization_args,
+    build_dataset_from_args,
+    print_action_quantization_summary,
+)
 from unitok_drive_lite.train_utils import greedy_rollout, seed_everything
 
 
@@ -30,6 +36,7 @@ def parse_args() -> argparse.Namespace:
         default="outputs/unitok_drive_lite/checkpoint_last",
     )
     add_dataset_selection_args(parser)
+    add_action_quantization_args(parser)
     parser.add_argument("--sample_index", type=int, default=0)
     parser.add_argument("--load_in_4bit", action="store_true")
     return parser.parse_args()
@@ -45,6 +52,7 @@ def main() -> None:
 
     config = build_default_config(project_root)
     config.model.load_in_4bit = args.load_in_4bit
+    apply_action_quantization_args(config.tokens, args)
     seed_everything(config.train.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -67,6 +75,7 @@ def main() -> None:
     model.load_checkpoint(checkpoint_dir)
     print(f"[model] backbone={config.model.model_name}")
     print(f"[model] load_in_4bit={config.model.load_in_4bit}")
+    print_action_quantization_summary(model.discretizer.get_action_quantization_summary())
 
     sample = dataset[args.sample_index]
     output = greedy_rollout(model, sample, device)

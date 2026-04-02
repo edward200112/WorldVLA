@@ -4,6 +4,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Tuple
 
+ACTION_QUANTIZATION_MODES: Tuple[str, str] = (
+    "uniform_with_deadband",
+    "nonuniform_zero_dense",
+)
+
 
 @dataclass
 class TokenConfig:
@@ -22,6 +27,12 @@ class TokenConfig:
     max_text_tokens: int = 32
     action_value_range: float = 1.5
     action_zero_deadband: float = 0.1
+    action_quantization_mode: str = "nonuniform_zero_dense"
+    action_longitudinal_quantization_mode: str | None = None
+    action_lateral_quantization_mode: str | None = None
+    action_longitudinal_zero_dense_power: float = 1.5
+    action_lateral_zero_dense_power: float = 2.5
+    action_lateral_near_zero_threshold: float = 0.1
     system_prompt: str = "你是一个 unified-token 自动驾驶规划模型。"
     action_token_prefix: str = "UT_ACT"
     bev_token_prefix: str = "UT_BEV"

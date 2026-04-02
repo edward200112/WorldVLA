@@ -22,11 +22,18 @@ from unitok_drive_lite import (
 )
 from unitok_drive_lite.eval_utils import (
     future_bev_difference_summary,
+    quantization_trajectory_stats,
     token_match_summary,
     trajectory_stats,
     tensor_to_list,
 )
-from unitok_drive_lite.script_utils import add_dataset_selection_args, build_dataset_from_args
+from unitok_drive_lite.script_utils import (
+    add_action_quantization_args,
+    add_dataset_selection_args,
+    apply_action_quantization_args,
+    build_dataset_from_args,
+    print_action_quantization_summary,
+)
 from unitok_drive_lite.train_utils import (
     build_optimizer,
     greedy_rollout,
@@ -40,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     """解析最小 overfit 验证脚本参数。"""
     parser = argparse.ArgumentParser(description="在极小数据子集上做最小 overfit 验证。")
     add_dataset_selection_args(parser, include_focus_scene_token=True)
+    add_action_quantization_args(parser)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--max_train_samples", type=int, default=4)
     parser.add_argument("--output_dir", type=str, default="outputs/unitok_drive_lite_overfit")
@@ -115,6 +123,7 @@ def main() -> None:
     config.train.supervise_action_only = args.supervise_action_only
     config.model.load_in_4bit = args.load_in_4bit
     config.model.gradient_checkpointing = not args.no_gradient_checkpointing
+    apply_action_quantization_args(config.tokens, args)
 
     seed_everything(config.train.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,6 +155,7 @@ def main() -> None:
         f"future_bev_loss_weight={config.train.future_bev_loss_weight} "
         f"supervise_action_only={config.train.supervise_action_only}"
     )
+    print_action_quantization_summary(model.discretizer.get_action_quantization_summary())
 
     collator = UnifiedDriveCollator(
         discretizer=model.discretizer,
@@ -179,6 +189,7 @@ def main() -> None:
 
     reference_sample = train_dataset[0]
     gt_action_tokens = [int(token_id) for token_id in model.discretizer.encode_future_actions(reference_sample.future_actions)]
+    gt_action_bin_indices = model.discretizer.quantize_future_action_bin_indices(reference_sample.future_actions).detach().cpu()
     gt_quantized_trajectory = model.discretizer.decode_action_tokens_to_trajectory(gt_action_tokens)
     gt_raw_trajectory = torch.cumsum(reference_sample.future_actions.detach().cpu().to(torch.float32), dim=0)
     gt_future_bevs = reference_sample.future_bevs.detach().cpu().to(torch.float32)
@@ -186,11 +197,16 @@ def main() -> None:
     rollout_output = greedy_rollout(model, reference_sample, device)
     predicted_action_tokens = [int(token_id) for token_id in rollout_output["predicted_action_tokens"]]
     predicted_quantized_trajectory = rollout_output["predicted_trajectory"].detach().cpu().to(torch.float32)
+    # 当前模型没有连续 action head，因此这里的 "raw" 仍然来自离散 token 解码。
     predicted_raw_trajectory = predicted_quantized_trajectory.clone()
     predicted_future_bevs = _stack_predicted_future_bevs(rollout_output["predicted_future_bevs"])
 
     match = token_match_summary(gt_action_tokens, predicted_action_tokens)
-    gt_quantization_stats = trajectory_stats(gt_quantized_trajectory, gt_raw_trajectory)
+    gt_quantization_stats = quantization_trajectory_stats(
+        gt_quantized_trajectory,
+        gt_raw_trajectory,
+        near_zero_lateral_threshold=config.tokens.action_lateral_near_zero_threshold,
+    )
     quantized_stats = trajectory_stats(predicted_quantized_trajectory, gt_quantized_trajectory)
     raw_stats = trajectory_stats(predicted_raw_trajectory, gt_raw_trajectory)
     future_bev_stats = future_bev_difference_summary(predicted_future_bevs, gt_future_bevs)
@@ -203,8 +219,10 @@ def main() -> None:
         "action_loss_weight": config.train.action_loss_weight,
         "future_bev_loss_weight": config.train.future_bev_loss_weight,
         "supervise_action_only": config.train.supervise_action_only,
+        "action_quantization": model.discretizer.get_action_quantization_summary(),
         "reference_metadata": reference_sample.metadata,
         "gt_action_tokens": gt_action_tokens,
+        "gt_action_bin_indices": tensor_to_list(gt_action_bin_indices),
         "predicted_action_tokens": predicted_action_tokens,
         "token_match_count": match["token_match_count"],
         "token_match_ratio": match["token_match_ratio"],
@@ -214,7 +232,7 @@ def main() -> None:
         "predicted_quantized_trajectory": tensor_to_list(predicted_quantized_trajectory),
         "gt_raw_trajectory": tensor_to_list(gt_raw_trajectory),
         "predicted_raw_trajectory": tensor_to_list(predicted_raw_trajectory),
-        "predicted_raw_trajectory_source": "decoded_action_tokens",
+        "predicted_raw_trajectory_source": "decoded_action_tokens_only_no_continuous_head",
         "gt_quantization_trajectory_stats": gt_quantization_stats,
         "quantized_trajectory_stats": quantized_stats,
         "raw_trajectory_stats": raw_stats,
