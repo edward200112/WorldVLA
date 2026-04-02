@@ -68,7 +68,10 @@ def _enable_only_new_token_rows(model: nn.Module, trainable_token_start: int) ->
         def _mask_old_rows(grad: torch.Tensor, start_index: int = trainable_token_start) -> torch.Tensor:
             """把旧词表行的梯度归零，仅保留新增 token 行。"""
             masked_grad = grad.clone()
-            masked_grad[:start_index, ...] = 0
+            if masked_grad.ndim == 1:
+                masked_grad[:start_index] = 0
+            else:
+                masked_grad[:start_index, ...] = 0
             return masked_grad
 
         hook_handles.append(parameter.register_hook(_mask_old_rows))
@@ -100,12 +103,22 @@ class UnifiedDriveModel(nn.Module):
         self.processor.tokenizer.padding_side = "left"
         self.tokenizer = self.processor.tokenizer
         self.token_registry = TokenRegistry.from_token_config(config.tokens)
+        self.token_registry.assert_unique_tokens()
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        old_vocab_size = len(self.tokenizer)
-        self.tokenizer.add_special_tokens({"additional_special_tokens": self.token_registry.all_special_tokens})
-        self.trainable_token_start = old_vocab_size
+        tokenizer_vocab_size_before = len(self.tokenizer)
+        num_added_tokens = self.tokenizer.add_special_tokens(
+            {"additional_special_tokens": self.token_registry.all_special_tokens}
+        )
+        tokenizer_vocab_size_after = len(self.tokenizer)
+        self.trainable_token_start = tokenizer_vocab_size_before
+        self._token_debug_header_printed = False
+        self._tokenizer_resize_debug = {
+            "tokenizer_vocab_size_before": tokenizer_vocab_size_before,
+            "num_added_tokens": int(num_added_tokens),
+            "tokenizer_vocab_size_after": tokenizer_vocab_size_after,
+        }
 
         pretrained_kwargs: Dict[str, Any] = {
             "torch_dtype": self.compute_dtype,
@@ -125,8 +138,7 @@ class UnifiedDriveModel(nn.Module):
             config.model.model_name,
             **pretrained_kwargs,
         )
-        if len(self.tokenizer) != old_vocab_size:
-            backbone.resize_token_embeddings(len(self.tokenizer))
+        self._sync_model_vocab_with_tokenizer(backbone)
         backbone.config.use_cache = False
 
         if config.model.load_in_4bit:
@@ -139,6 +151,7 @@ class UnifiedDriveModel(nn.Module):
             lora_alpha=config.model.lora_alpha,
             lora_dropout=config.model.lora_dropout,
             target_modules=list(config.model.lora_target_modules),
+            modules_to_save=["embed_tokens", "lm_head"],
             bias="none",
             task_type=TaskType.CAUSAL_LM,
         )
@@ -151,7 +164,186 @@ class UnifiedDriveModel(nn.Module):
             processor=self.processor,
             config=config.tokens,
         )
+        self.token_registry.assert_tokenizer_alignment(
+            tokenizer=self.tokenizer,
+            vocab_size=self.get_logits_vocab_size(),
+        )
         self._supports_custom_4d_mask = True
+
+    def get_input_embedding_vocab_size(self) -> int:
+        """返回输入 embedding 的词表大小。"""
+        input_embeddings = self.backbone.get_input_embeddings()
+        if input_embeddings is None or getattr(input_embeddings, "weight", None) is None:
+            raise RuntimeError("模型缺少输入 embedding 权重。")
+        return int(input_embeddings.weight.shape[0])
+
+    def get_lm_head_vocab_size(self) -> int | None:
+        """返回 lm_head 词表大小；如果没有暴露输出 embedding，则返回 None。"""
+        output_embeddings = self.backbone.get_output_embeddings()
+        if output_embeddings is None or getattr(output_embeddings, "weight", None) is None:
+            return None
+        return int(output_embeddings.weight.shape[0])
+
+    def get_logits_vocab_size(self) -> int:
+        """返回用于监督的 logits 词表大小。"""
+        lm_head_vocab_size = self.get_lm_head_vocab_size()
+        if lm_head_vocab_size is not None:
+            return lm_head_vocab_size
+        return self.get_input_embedding_vocab_size()
+
+    def _sync_model_vocab_with_tokenizer(self, backbone: nn.Module) -> None:
+        """确保 tokenizer、输入 embedding 和输出 head 的词表大小一致。"""
+        tokenizer_vocab_size = len(self.tokenizer)
+        input_embeddings = backbone.get_input_embeddings()
+        input_vocab_size = (
+            None if input_embeddings is None or getattr(input_embeddings, "weight", None) is None
+            else int(input_embeddings.weight.shape[0])
+        )
+        output_embeddings = backbone.get_output_embeddings()
+        output_vocab_size = (
+            None if output_embeddings is None or getattr(output_embeddings, "weight", None) is None
+            else int(output_embeddings.weight.shape[0])
+        )
+        self._tokenizer_resize_debug.update(
+            {
+                "input_vocab_size_before_resize": input_vocab_size,
+                "output_vocab_size_before_resize": output_vocab_size,
+            }
+        )
+
+        if input_vocab_size != tokenizer_vocab_size or (
+            output_vocab_size is not None and output_vocab_size != tokenizer_vocab_size
+        ):
+            backbone.resize_token_embeddings(tokenizer_vocab_size)
+            if hasattr(backbone, "tie_weights"):
+                backbone.tie_weights()
+
+        input_embeddings = backbone.get_input_embeddings()
+        output_embeddings = backbone.get_output_embeddings()
+        input_vocab_size_after = (
+            None if input_embeddings is None or getattr(input_embeddings, "weight", None) is None
+            else int(input_embeddings.weight.shape[0])
+        )
+        output_vocab_size_after = (
+            None if output_embeddings is None or getattr(output_embeddings, "weight", None) is None
+            else int(output_embeddings.weight.shape[0])
+        )
+        self._tokenizer_resize_debug.update(
+            {
+                "input_vocab_size_after_resize": input_vocab_size_after,
+                "output_vocab_size_after_resize": output_vocab_size_after,
+            }
+        )
+
+        if input_vocab_size_after != tokenizer_vocab_size:
+            raise RuntimeError(
+                "resize_token_embeddings 后输入 embedding 词表仍与 tokenizer 不一致: "
+                f"tokenizer={tokenizer_vocab_size} input_vocab={input_vocab_size_after}"
+            )
+        if output_vocab_size_after is not None and output_vocab_size_after != tokenizer_vocab_size:
+            raise RuntimeError(
+                "resize_token_embeddings 后 lm_head 词表仍与 tokenizer 不一致: "
+                f"tokenizer={tokenizer_vocab_size} lm_head_vocab={output_vocab_size_after}"
+            )
+
+    def _format_token_from_id(self, token_id: int) -> str:
+        """把 token id 转成人可读字符串。"""
+        if token_id < 0:
+            return f"<negative:{token_id}>"
+        if token_id >= len(self.tokenizer):
+            return f"<out-of-tokenizer-range:{token_id}>"
+        token = self.tokenizer.convert_ids_to_tokens(int(token_id))
+        return str(token)
+
+    def _print_label_debug_header(self, logits_vocab_size: int) -> None:
+        """首次训练前打印 tokenizer / model 词表对齐信息。"""
+        if self._token_debug_header_printed:
+            return
+        print(
+            "[debug:vocab] "
+            f"len(tokenizer)={len(self.tokenizer)} "
+            f"input_embedding_vocab={self.get_input_embedding_vocab_size()} "
+            f"lm_head_vocab={self.get_lm_head_vocab_size()} "
+            f"logits_vocab={logits_vocab_size} "
+            f"trainable_token_start={self.trainable_token_start} "
+            f"num_added_tokens={self._tokenizer_resize_debug['num_added_tokens']}"
+        )
+        print(f"[debug:vocab] resize_info={self._tokenizer_resize_debug}")
+        self._token_debug_header_printed = True
+
+    def _validate_labels_before_loss(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> None:
+        """在 loss 前做显式标签范围检查，并打印必要调试信息。"""
+        logits_vocab_size = int(logits.size(-1))
+        tokenizer_vocab_size = len(self.tokenizer)
+        input_vocab_size = self.get_input_embedding_vocab_size()
+        lm_head_vocab_size = self.get_lm_head_vocab_size()
+        self._print_label_debug_header(logits_vocab_size)
+        self.token_registry.assert_tokenizer_alignment(
+            tokenizer=self.tokenizer,
+            vocab_size=logits_vocab_size,
+        )
+        if tokenizer_vocab_size != input_vocab_size:
+            raise RuntimeError(
+                f"tokenizer 与输入 embedding 词表不一致: tokenizer={tokenizer_vocab_size}, "
+                f"input_embedding_vocab={input_vocab_size}"
+            )
+        if lm_head_vocab_size is not None and lm_head_vocab_size != logits_vocab_size:
+            raise RuntimeError(
+                f"lm_head 词表与 logits 不一致: lm_head_vocab={lm_head_vocab_size}, logits_vocab={logits_vocab_size}"
+            )
+
+        detached_labels = labels.detach()
+        valid_mask = detached_labels.ne(-100)
+        invalid_low_mask = detached_labels.lt(-100)
+        invalid_high_mask = valid_mask & detached_labels.ge(logits_vocab_size)
+        valid_labels = detached_labels[valid_mask]
+
+        min_label = int(valid_labels.min().item()) if valid_labels.numel() > 0 else None
+        max_label = int(valid_labels.max().item()) if valid_labels.numel() > 0 else None
+        print(
+            "[debug:labels] "
+            f"valid_label_count={int(valid_mask.sum().item())} "
+            f"min_valid_label={min_label} "
+            f"max_valid_label={max_label} "
+            f"has_label_lt_-100={bool(invalid_low_mask.any().item())} "
+            f"has_label_ge_logits_vocab={bool(invalid_high_mask.any().item())}"
+        )
+
+        if invalid_low_mask.any() or invalid_high_mask.any():
+            offending_mask = invalid_low_mask | invalid_high_mask
+            offending_positions = torch.nonzero(offending_mask, as_tuple=False)[:16]
+            offending_records: list[dict[str, Any]] = []
+            for position in offending_positions.tolist():
+                batch_index, token_index = position
+                label_value = int(detached_labels[batch_index, token_index].item())
+                input_id_value = int(input_ids[batch_index, token_index].item())
+                offending_records.append(
+                    {
+                        "batch_index": batch_index,
+                        "token_index": token_index,
+                        "label_id": label_value,
+                        "label_token": self._format_token_from_id(label_value),
+                        "input_id": input_id_value,
+                        "input_token": self._format_token_from_id(input_id_value),
+                    }
+                )
+            flat_offending_ids = detached_labels[offending_mask][:16].tolist()
+            offending_tokens = [self._format_token_from_id(int(token_id)) for token_id in flat_offending_ids]
+            raise RuntimeError(
+                "训练标签超出有效范围。"
+                f" tokenizer={tokenizer_vocab_size}, input_vocab={input_vocab_size}, "
+                f"lm_head_vocab={lm_head_vocab_size}, logits_vocab={logits_vocab_size}, "
+                f"min_valid_label={min_label}, max_valid_label={max_label}, "
+                f"label_lt_-100={bool(invalid_low_mask.any().item())}, "
+                f"label_ge_logits_vocab={bool(invalid_high_mask.any().item())}, "
+                f"offending_ids={flat_offending_ids}, offending_tokens={offending_tokens}, "
+                f"offending_positions={offending_records}"
+            )
 
     @property
     def device(self) -> torch.device:
@@ -230,6 +422,7 @@ class UnifiedDriveModel(nn.Module):
         logits = torch.cat(logits_list, dim=0)
         loss: Optional[torch.Tensor] = None
         if labels is not None:
+            self._validate_labels_before_loss(input_ids, labels, logits)
             loss_function = nn.CrossEntropyLoss(ignore_index=-100)
             loss = loss_function(logits.view(-1, logits.size(-1)), labels.view(-1))
         return {"logits": logits, "loss": loss}

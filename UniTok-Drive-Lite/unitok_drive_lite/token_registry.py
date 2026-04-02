@@ -152,3 +152,31 @@ class TokenRegistry:
             bev_token_ids=[_resolve_token_id(tokenizer, token) for token in self.bev_tokens],
             summary_token_ids=[_resolve_token_id(tokenizer, token) for token in self.summary_tokens],
         )
+
+    def assert_unique_tokens(self) -> None:
+        """校验 registry 中的 token 字符串没有重复。"""
+        all_tokens = self.all_special_tokens
+        if len(all_tokens) != len(set(all_tokens)):
+            raise ValueError("TokenRegistry 中存在重复 token 字符串。")
+
+    def assert_tokenizer_alignment(self, tokenizer: Any, vocab_size: int | None = None) -> None:
+        """校验 registry 在 tokenizer 下解析出的 id 唯一且位于词表范围内。"""
+        self.assert_unique_tokens()
+        resolved = self.resolve_tokenizer(tokenizer)
+        id_lists = [
+            list(resolved.special_token_ids.values()),
+            list(resolved.structured_label_token_ids.values()),
+            list(resolved.action_token_ids),
+            list(resolved.bev_token_ids),
+            list(resolved.summary_token_ids),
+        ]
+        all_ids = [token_id for token_ids in id_lists for token_id in token_ids]
+        if len(all_ids) != len(set(all_ids)):
+            raise ValueError("TokenRegistry 解析出的 token id 不唯一。")
+        if vocab_size is not None:
+            invalid_ids = [token_id for token_id in all_ids if token_id < 0 or token_id >= vocab_size]
+            if invalid_ids:
+                raise ValueError(
+                    f"TokenRegistry 解析出的 token id 超出模型词表范围: "
+                    f"count={len(invalid_ids)} sample={invalid_ids[:8]} vocab_size={vocab_size}"
+                )

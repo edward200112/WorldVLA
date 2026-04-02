@@ -56,6 +56,24 @@
 
 同一个训练集、同一个推理流程、同一个 tokenizer 扩词顺序下，token id 保持一致。
 
+当前主链路的词表策略是：
+
+- **使用 added special tokens + `resize_token_embeddings(...)`**
+- **不复用 Emu3 现有普通语义 token id**
+
+唯一的 token source of truth 在：
+
+- `unitok_drive_lite/token_registry.py`
+
+当前实现会在模型初始化时显式校验：
+
+- tokenizer 词表大小
+- 输入 embedding 词表大小
+- lm_head / logits 词表大小
+- registry 解析出的 token id 是否唯一且全部位于模型词表范围内
+
+因此，如果本地 `hf_models/Emu3-Chat-hf` 目录里的 tokenizer 已被扩词，而模型权重词表还停留在旧大小，主链路会自动做 resize 并在训练前打印调试信息。
+
 ## 项目边界
 
 这是一个最小原型，不是完整自动驾驶栈，也不是可直接部署的系统。当前边界：
