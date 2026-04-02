@@ -138,6 +138,7 @@ def main() -> None:
     sample_records: List[Dict[str, Any]] = []
     quantized_stats_records: List[Dict[str, Any]] = []
     raw_stats_records: List[Dict[str, Any]] = []
+    gt_quantization_stats_records: List[Dict[str, Any]] = []
 
     for sample_index in indices:
         sample = dataset[sample_index]
@@ -153,6 +154,7 @@ def main() -> None:
         # 当前模型只输出离散 action token，因此“predicted raw trajectory”与量化解码轨迹相同。
         predicted_raw_trajectory = predicted_quantized_trajectory.clone()
 
+        gt_quantization_stats = trajectory_stats(gt_quantized_trajectory, gt_raw_trajectory)
         quantized_stats = trajectory_stats(predicted_quantized_trajectory, gt_quantized_trajectory)
         raw_stats = trajectory_stats(predicted_raw_trajectory, gt_raw_trajectory)
         gt_future_bevs = sample.future_bevs.detach().cpu().to(torch.float32)
@@ -169,6 +171,7 @@ def main() -> None:
         total_token_correct += match["token_match_count"]
         total_token_count += len(gt_action_tokens)
         exact_sequence_match_count += int(match["exact_sequence_match"])
+        gt_quantization_stats_records.append(gt_quantization_stats)
         quantized_stats_records.append(quantized_stats)
         raw_stats_records.append(raw_stats)
 
@@ -204,6 +207,7 @@ def main() -> None:
                 "gt_raw_trajectory": tensor_to_list(gt_raw_trajectory),
                 "predicted_raw_trajectory": tensor_to_list(predicted_raw_trajectory),
                 "predicted_raw_trajectory_source": "decoded_action_tokens",
+                "gt_quantization_trajectory_stats": gt_quantization_stats,
                 "quantized_trajectory_stats": quantized_stats,
                 "raw_trajectory_stats": raw_stats,
                 "future_bev_difference_summary": future_bev_stats,
@@ -253,6 +257,8 @@ def main() -> None:
         "token_accuracy_per_position": token_accuracy_per_position,
         "exact_sequence_match_count": exact_sequence_match_count,
         "exact_sequence_match_ratio": float(exact_sequence_match_count / max(len(indices), 1)),
+        "gt_quantization_trajectory_mae_mean": _mean_from_records(gt_quantization_stats_records, "mean_abs_error"),
+        "gt_quantization_final_step_l2_mean": _mean_from_records(gt_quantization_stats_records, "final_step_l2"),
         "quantized_trajectory_mae_mean": _mean_from_records(quantized_stats_records, "mean_abs_error"),
         "quantized_final_step_l2_mean": _mean_from_records(quantized_stats_records, "final_step_l2"),
         "raw_trajectory_mae_mean": _mean_from_records(raw_stats_records, "mean_abs_error"),
@@ -275,7 +281,8 @@ def main() -> None:
         f"exact_sequence_match_ratio={summary['exact_sequence_match_ratio']:.4f}"
     )
     print(
-        f"[analysis] quantized_final_step_l2_mean={summary['quantized_final_step_l2_mean']:.4f} "
+        f"[analysis] gt_quantization_final_step_l2_mean={summary['gt_quantization_final_step_l2_mean']:.4f} "
+        f"quantized_final_step_l2_mean={summary['quantized_final_step_l2_mean']:.4f} "
         f"raw_final_step_l2_mean={summary['raw_final_step_l2_mean']:.4f}"
     )
     print(f"[analysis] unique_scene_count={summary['unique_scene_count']}")

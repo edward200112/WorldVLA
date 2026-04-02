@@ -190,6 +190,7 @@ def main() -> None:
     predicted_future_bevs = _stack_predicted_future_bevs(rollout_output["predicted_future_bevs"])
 
     match = token_match_summary(gt_action_tokens, predicted_action_tokens)
+    gt_quantization_stats = trajectory_stats(gt_quantized_trajectory, gt_raw_trajectory)
     quantized_stats = trajectory_stats(predicted_quantized_trajectory, gt_quantized_trajectory)
     raw_stats = trajectory_stats(predicted_raw_trajectory, gt_raw_trajectory)
     future_bev_stats = future_bev_difference_summary(predicted_future_bevs, gt_future_bevs)
@@ -214,6 +215,7 @@ def main() -> None:
         "gt_raw_trajectory": tensor_to_list(gt_raw_trajectory),
         "predicted_raw_trajectory": tensor_to_list(predicted_raw_trajectory),
         "predicted_raw_trajectory_source": "decoded_action_tokens",
+        "gt_quantization_trajectory_stats": gt_quantization_stats,
         "quantized_trajectory_stats": quantized_stats,
         "raw_trajectory_stats": raw_stats,
         "future_bev_difference_summary": future_bev_stats,
@@ -248,6 +250,7 @@ def main() -> None:
         f"exact_sequence_match={match['exact_sequence_match']}"
     )
     print("[report] per_position_token_correctness=", match["per_position_token_correctness"])
+    print("[report] gt_quantization_trajectory_stats=", gt_quantization_stats)
     print("[report] quantized_trajectory_stats=", quantized_stats)
     print("[report] raw_trajectory_stats=", raw_stats)
     print("[report] future_bev_difference_summary=", future_bev_stats)

@@ -218,6 +218,38 @@ class UnifiedDriveDiscretizer:
         flat_index = discrete[:, 0] * bins_per_dim + discrete[:, 1]
         return [token_ids[index] for index in flat_index.tolist()]
 
+    def _build_action_bin_centers(self) -> torch.Tensor:
+        """构造 future action 的每维离散中心。
+
+        当前最小原型里，nuScenes 的 lateral 真实值大量落在 0 附近。
+        如果直接用偶数个均匀 bin，零附近没有真正的 zero bin，会把极小扰动
+        强行压到正负两侧相邻 token。这里保留原有 token 数，只把一个近零 bin
+        显式改成 0.0，并配合 deadband 提升 target fidelity。
+        """
+        bins_per_dim = self.config.action_bins_per_dim
+        centers = torch.linspace(
+            -self.config.action_value_range,
+            self.config.action_value_range,
+            steps=bins_per_dim,
+            dtype=torch.float32,
+        )
+        zero_bin_index = bins_per_dim // 2
+        centers[zero_bin_index] = 0.0
+        return centers
+
+    def _quantize_future_action_vectors(self, vectors: torch.Tensor) -> List[int]:
+        """把 future action 量化到固定 token，零附近使用 deadband。"""
+        centers = self._build_action_bin_centers().to(device=vectors.device)
+        clipped = vectors.clamp(-self.config.action_value_range, self.config.action_value_range).to(torch.float32)
+        if self.config.action_zero_deadband > 0.0:
+            clipped = clipped.clone()
+            clipped[clipped.abs() <= float(self.config.action_zero_deadband)] = 0.0
+
+        distances = (clipped.unsqueeze(-1) - centers.view(1, 1, -1)).abs()
+        discrete = torch.argmin(distances, dim=-1).to(torch.long)
+        flat_index = discrete[:, 0] * self.config.action_bins_per_dim + discrete[:, 1]
+        return [self.layout.action_token_ids[index] for index in flat_index.tolist()]
+
     def encode_bev(self, bev: torch.Tensor) -> List[int]:
         """把一帧 BEV 编码成固定全局 BEV token。"""
         return self._quantize_scalars(self._pool_bev_to_scalars(bev), self.layout.bev_token_ids)
@@ -228,11 +260,7 @@ class UnifiedDriveDiscretizer:
 
     def encode_future_actions(self, future_actions: torch.Tensor) -> List[int]:
         """把未来连续动作编码成 raw action token。"""
-        return self._quantize_vectors(
-            future_actions,
-            bins_per_dim=self.config.action_bins_per_dim,
-            token_ids=self.layout.action_token_ids,
-        )
+        return self._quantize_future_action_vectors(future_actions)
 
     def encode_history_summary(self, history_actions: torch.Tensor) -> int:
         """把历史动作压缩成一个 summary token。"""
@@ -342,13 +370,15 @@ class UnifiedDriveDiscretizer:
         """把 raw action token 还原为连续动作增量。"""
         vectors: List[List[float]] = []
         bins_per_dim = self.config.action_bins_per_dim
+        centers = self._build_action_bin_centers()
         for token_id in token_ids:
             flat_index = self.action_token_to_index[token_id]
             x_bin = flat_index // bins_per_dim
             y_bin = flat_index % bins_per_dim
-            discrete = torch.tensor([x_bin, y_bin], dtype=torch.float32)
-            normalized = discrete / max(bins_per_dim - 1, 1)
-            continuous = normalized * (2.0 * self.config.action_value_range) - self.config.action_value_range
+            continuous = torch.tensor(
+                [centers[x_bin].item(), centers[y_bin].item()],
+                dtype=torch.float32,
+            )
             vectors.append(continuous.tolist())
         return torch.tensor(vectors, dtype=torch.float32)
 

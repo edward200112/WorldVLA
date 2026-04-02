@@ -21,6 +21,7 @@ class TokenConfig:
     future_bev_frames: int = 3
     max_text_tokens: int = 32
     action_value_range: float = 1.5
+    action_zero_deadband: float = 0.1
     system_prompt: str = "你是一个 unified-token 自动驾驶规划模型。"
     action_token_prefix: str = "UT_ACT"
     bev_token_prefix: str = "UT_BEV"
