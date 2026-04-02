@@ -1,14 +1,13 @@
-"""最小 action token 分布分析脚本。"""
+"""最小 GT-vs-Pred action 评估脚本。"""
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
 import json
-import math
 from pathlib import Path
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 
@@ -17,13 +16,22 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from unitok_drive_lite import UnifiedDriveModel, build_default_config
+from unitok_drive_lite.eval_utils import (
+    build_per_position_distribution,
+    counter_to_top_k,
+    entropy_nats,
+    future_bev_difference_summary,
+    token_match_summary,
+    trajectory_stats,
+    tensor_to_list,
+)
 from unitok_drive_lite.script_utils import add_dataset_selection_args, build_dataset_from_args
 from unitok_drive_lite.train_utils import greedy_rollout, seed_everything
 
 
 def parse_args() -> argparse.Namespace:
-    """解析 action 分布分析参数。"""
-    parser = argparse.ArgumentParser(description="分析最小主链路的 predicted action token 分布。")
+    """解析 GT-vs-Pred 评估参数。"""
+    parser = argparse.ArgumentParser(description="分析最小主链路的 GT-vs-Pred action token 表现。")
     parser.add_argument(
         "--checkpoint_dir",
         type=str,
@@ -42,61 +50,51 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _counter_to_top_k(counter: Counter, top_k: int, denominator: int) -> List[Dict[str, Any]]:
-    """把 Counter 转成可 JSON 序列化的 top-k 摘要。"""
-    top_items: List[Dict[str, Any]] = []
-    for token_id, count in counter.most_common(top_k):
-        top_items.append(
-            {
-                "token_id": int(token_id),
-                "count": int(count),
-                "frequency": float(count / max(denominator, 1)),
-            }
-        )
-    return top_items
-
-
-def _entropy_nats(counter: Counter) -> float:
-    """计算 token 分布熵，单位为 nats。"""
-    total = sum(counter.values())
-    if total <= 0:
-        return 0.0
-
-    entropy = 0.0
-    for count in counter.values():
-        probability = count / total
-        entropy -= probability * math.log(probability)
-    return float(entropy)
-
-
 def _sample_indices(length: int, stride: int, limit: int) -> List[int]:
     """生成分析用样本索引。"""
     if stride <= 0:
         raise ValueError(f"--sample_stride 必须大于 0，当前收到 {stride}")
     if limit <= 0:
         raise ValueError(f"--max_eval_samples 必须大于 0，当前收到 {limit}")
-
-    indices = list(range(0, length, stride))
-    return indices[:limit]
+    return list(range(0, length, stride))[:limit]
 
 
-def _build_example_record(
-    sample_index: int,
-    metadata: Dict[str, Any],
-    predicted_action_tokens: List[int],
-    predicted_trajectory: torch.Tensor,
-) -> Dict[str, Any]:
-    """构造少量样例轨迹记录。"""
-    return {
-        "sample_index": sample_index,
-        "metadata": metadata,
-        "predicted_action_tokens": [int(token_id) for token_id in predicted_action_tokens],
-        "predicted_trajectory": predicted_trajectory.tolist(),
-    }
+def _stack_predicted_future_bevs(predicted_future_bevs: List[torch.Tensor]) -> torch.Tensor:
+    """把 rollout 返回的 future BEV 列表堆叠成 [F, 1, H, W]。"""
+    return torch.stack([frame.detach().cpu().to(torch.float32) for frame in predicted_future_bevs], dim=0)
+
+
+def _scene_key(metadata: Dict[str, Any]) -> Tuple[str, str]:
+    """提取 scene token / name。"""
+    return str(metadata.get("scene_token", "unknown")), str(metadata.get("scene_name", "unknown"))
+
+
+def _mean_from_records(records: List[Dict[str, Any]], field_name: str) -> float:
+    """从一组 sample record 中取某个标量字段均值。"""
+    if not records:
+        return 0.0
+    return float(sum(float(record[field_name]) for record in records) / len(records))
+
+
+def _print_example_mismatches(sample_records: List[Dict[str, Any]], max_examples: int = 3) -> None:
+    """打印少量 GT-vs-Pred 不匹配样例。"""
+    mismatch_records = [record for record in sample_records if not record["exact_sequence_match"]]
+    if not mismatch_records:
+        print("[analysis] 所有评估样本都达到了 exact sequence match。")
+        return
+
+    print("[analysis] example_mismatches=")
+    for record in mismatch_records[:max_examples]:
+        print(
+            f"  sample_index={record['sample_index']} scene={record['metadata'].get('scene_name', 'unknown')} "
+            f"token_match_ratio={record['token_match_ratio']:.3f}"
+        )
+        print(f"    gt={record['gt_action_tokens']}")
+        print(f"    pred={record['predicted_action_tokens']}")
 
 
 def main() -> None:
-    """运行最小 action 分布分析。"""
+    """运行 GT-vs-Pred action 评估。"""
     args = parse_args()
     checkpoint_dir = PROJECT_ROOT / args.checkpoint_dir
     if not checkpoint_dir.exists():
@@ -126,57 +124,140 @@ def main() -> None:
     print(f"[model] load_in_4bit={config.model.load_in_4bit}")
     print(f"[data] dataset_type={args.dataset_type} eval_samples={len(indices)}")
 
-    flat_counter: Counter = Counter()
-    per_position_counters = [
-        Counter() for _ in range(config.tokens.future_action_horizon)
-    ]
-    example_records: List[Dict[str, Any]] = []
+    gt_counter: Counter = Counter()
+    predicted_counter: Counter = Counter()
+    gt_per_position_counters = [Counter() for _ in range(config.tokens.future_action_horizon)]
+    predicted_per_position_counters = [Counter() for _ in range(config.tokens.future_action_horizon)]
+
+    total_token_correct = 0
+    total_token_count = 0
+    exact_sequence_match_count = 0
+    per_position_correct_count = [0 for _ in range(config.tokens.future_action_horizon)]
+
+    scene_aggregates: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    sample_records: List[Dict[str, Any]] = []
+    quantized_stats_records: List[Dict[str, Any]] = []
+    raw_stats_records: List[Dict[str, Any]] = []
 
     for sample_index in indices:
         sample = dataset[sample_index]
-        output = greedy_rollout(model, sample, device)
-        predicted_action_tokens = [int(token_id) for token_id in output["predicted_action_tokens"]]
-        predicted_trajectory = output["predicted_trajectory"].detach().cpu()
+        rollout_output = greedy_rollout(model, sample, device)
 
-        for position, token_id in enumerate(predicted_action_tokens):
-            flat_counter[token_id] += 1
-            if position < len(per_position_counters):
-                per_position_counters[position][token_id] += 1
+        gt_action_tokens = [int(token_id) for token_id in model.discretizer.encode_future_actions(sample.future_actions)]
+        predicted_action_tokens = [int(token_id) for token_id in rollout_output["predicted_action_tokens"]]
+        match = token_match_summary(gt_action_tokens, predicted_action_tokens)
 
-        if len(example_records) < 3:
-            example_records.append(
-                _build_example_record(
-                    sample_index=sample_index,
-                    metadata=sample.metadata,
-                    predicted_action_tokens=predicted_action_tokens,
-                    predicted_trajectory=predicted_trajectory,
-                )
-            )
+        gt_quantized_trajectory = model.discretizer.decode_action_tokens_to_trajectory(gt_action_tokens)
+        predicted_quantized_trajectory = rollout_output["predicted_trajectory"].detach().cpu().to(torch.float32)
+        gt_raw_trajectory = torch.cumsum(sample.future_actions.detach().cpu().to(torch.float32), dim=0)
+        # 当前模型只输出离散 action token，因此“predicted raw trajectory”与量化解码轨迹相同。
+        predicted_raw_trajectory = predicted_quantized_trajectory.clone()
 
-    total_predicted_tokens = sum(flat_counter.values())
-    unique_token_count = len(flat_counter)
-    top_tokens = _counter_to_top_k(flat_counter, args.top_k, total_predicted_tokens)
-    per_position_summary: List[Dict[str, Any]] = []
-    for position, counter in enumerate(per_position_counters):
-        per_position_summary.append(
+        quantized_stats = trajectory_stats(predicted_quantized_trajectory, gt_quantized_trajectory)
+        raw_stats = trajectory_stats(predicted_raw_trajectory, gt_raw_trajectory)
+        gt_future_bevs = sample.future_bevs.detach().cpu().to(torch.float32)
+        predicted_future_bevs = _stack_predicted_future_bevs(rollout_output["predicted_future_bevs"])
+        future_bev_stats = future_bev_difference_summary(predicted_future_bevs, gt_future_bevs)
+
+        for position, (gt_token_id, predicted_token_id) in enumerate(zip(gt_action_tokens, predicted_action_tokens)):
+            gt_counter[gt_token_id] += 1
+            predicted_counter[predicted_token_id] += 1
+            gt_per_position_counters[position][gt_token_id] += 1
+            predicted_per_position_counters[position][predicted_token_id] += 1
+            per_position_correct_count[position] += int(gt_token_id == predicted_token_id)
+
+        total_token_correct += match["token_match_count"]
+        total_token_count += len(gt_action_tokens)
+        exact_sequence_match_count += int(match["exact_sequence_match"])
+        quantized_stats_records.append(quantized_stats)
+        raw_stats_records.append(raw_stats)
+
+        scene_token, scene_name = _scene_key(sample.metadata)
+        scene_entry = scene_aggregates.setdefault(
+            (scene_token, scene_name),
             {
-                "position": position,
-                "unique_token_count": len(counter),
-                "top_tokens": _counter_to_top_k(counter, min(args.top_k, 5), sum(counter.values())),
+                "scene_token": scene_token,
+                "scene_name": scene_name,
+                "sample_count": 0,
+                "token_correct": 0,
+                "token_total": 0,
+                "exact_sequence_match_count": 0,
+            },
+        )
+        scene_entry["sample_count"] += 1
+        scene_entry["token_correct"] += match["token_match_count"]
+        scene_entry["token_total"] += len(gt_action_tokens)
+        scene_entry["exact_sequence_match_count"] += int(match["exact_sequence_match"])
+
+        sample_records.append(
+            {
+                "sample_index": sample_index,
+                "metadata": sample.metadata,
+                "gt_action_tokens": gt_action_tokens,
+                "predicted_action_tokens": predicted_action_tokens,
+                "token_match_count": match["token_match_count"],
+                "token_match_ratio": match["token_match_ratio"],
+                "exact_sequence_match": match["exact_sequence_match"],
+                "per_position_token_correctness": match["per_position_token_correctness"],
+                "gt_quantized_trajectory": tensor_to_list(gt_quantized_trajectory),
+                "predicted_quantized_trajectory": tensor_to_list(predicted_quantized_trajectory),
+                "gt_raw_trajectory": tensor_to_list(gt_raw_trajectory),
+                "predicted_raw_trajectory": tensor_to_list(predicted_raw_trajectory),
+                "predicted_raw_trajectory_source": "decoded_action_tokens",
+                "quantized_trajectory_stats": quantized_stats,
+                "raw_trajectory_stats": raw_stats,
+                "future_bev_difference_summary": future_bev_stats,
             }
         )
+
+    per_scene_summary: List[Dict[str, Any]] = []
+    for scene_summary in scene_aggregates.values():
+        token_total = max(int(scene_summary["token_total"]), 1)
+        sample_count = max(int(scene_summary["sample_count"]), 1)
+        per_scene_summary.append(
+            {
+                "scene_token": scene_summary["scene_token"],
+                "scene_name": scene_summary["scene_name"],
+                "sample_count": int(scene_summary["sample_count"]),
+                "token_accuracy_overall": float(scene_summary["token_correct"] / token_total),
+                "exact_sequence_match_ratio": float(scene_summary["exact_sequence_match_count"] / sample_count),
+            }
+        )
+    per_scene_summary.sort(key=lambda item: item["sample_count"], reverse=True)
+
+    token_accuracy_overall = float(total_token_correct / max(total_token_count, 1))
+    token_accuracy_per_position = [
+        float(correct_count / max(len(indices), 1)) for correct_count in per_position_correct_count
+    ]
 
     summary = {
         "checkpoint_dir": str(checkpoint_dir),
         "dataset_type": args.dataset_type,
         "evaluated_sample_count": len(indices),
         "sample_indices": indices,
-        "unique_predicted_action_token_count": unique_token_count,
-        "total_predicted_action_token_count": total_predicted_tokens,
-        "entropy_nats": _entropy_nats(flat_counter),
-        "top_predicted_action_tokens": top_tokens,
-        "per_position_distribution": per_position_summary,
-        "example_decoded_trajectories": example_records,
+        "unique_scene_count": len(per_scene_summary),
+        "per_scene_summary": per_scene_summary,
+        "gt_unique_action_token_count": len(gt_counter),
+        "pred_unique_action_token_count": len(predicted_counter),
+        "gt_entropy_nats": entropy_nats(gt_counter),
+        "pred_entropy_nats": entropy_nats(predicted_counter),
+        "top_gt_action_tokens": counter_to_top_k(gt_counter, args.top_k, sum(gt_counter.values())),
+        "top_pred_action_tokens": counter_to_top_k(
+            predicted_counter,
+            args.top_k,
+            sum(predicted_counter.values()),
+        ),
+        "per_position_gt_distribution": build_per_position_distribution(gt_per_position_counters, args.top_k),
+        "per_position_pred_distribution": build_per_position_distribution(predicted_per_position_counters, args.top_k),
+        "token_accuracy_overall": token_accuracy_overall,
+        "token_accuracy_per_position": token_accuracy_per_position,
+        "exact_sequence_match_count": exact_sequence_match_count,
+        "exact_sequence_match_ratio": float(exact_sequence_match_count / max(len(indices), 1)),
+        "quantized_trajectory_mae_mean": _mean_from_records(quantized_stats_records, "mean_abs_error"),
+        "quantized_final_step_l2_mean": _mean_from_records(quantized_stats_records, "final_step_l2"),
+        "raw_trajectory_mae_mean": _mean_from_records(raw_stats_records, "mean_abs_error"),
+        "raw_final_step_l2_mean": _mean_from_records(raw_stats_records, "final_step_l2"),
+        "per_sample_results": sample_records,
     }
 
     output_json = PROJECT_ROOT / args.output_json
@@ -185,21 +266,39 @@ def main() -> None:
         json.dump(summary, file, ensure_ascii=False, indent=2)
 
     print(f"[analysis] evaluated_sample_count={summary['evaluated_sample_count']}")
-    print(f"[analysis] unique_predicted_action_token_count={unique_token_count}")
-    print(f"[analysis] entropy_nats={summary['entropy_nats']:.4f}")
-    print("[analysis] top_predicted_action_tokens=")
-    for item in top_tokens:
+    print(
+        f"[analysis] gt_entropy_nats={summary['gt_entropy_nats']:.4f} "
+        f"pred_entropy_nats={summary['pred_entropy_nats']:.4f}"
+    )
+    print(
+        f"[analysis] token_accuracy_overall={summary['token_accuracy_overall']:.4f} "
+        f"exact_sequence_match_ratio={summary['exact_sequence_match_ratio']:.4f}"
+    )
+    print(
+        f"[analysis] quantized_final_step_l2_mean={summary['quantized_final_step_l2_mean']:.4f} "
+        f"raw_final_step_l2_mean={summary['raw_final_step_l2_mean']:.4f}"
+    )
+    print(f"[analysis] unique_scene_count={summary['unique_scene_count']}")
+    print("[analysis] top_gt_action_tokens=")
+    for item in summary["top_gt_action_tokens"]:
         print(
             f"  token_id={item['token_id']} count={item['count']} "
             f"frequency={item['frequency']:.4f}"
         )
-    print("[analysis] example_decoded_trajectories=")
-    for record in example_records:
-        final_point = record["predicted_trajectory"][-1]
+    print("[analysis] top_pred_action_tokens=")
+    for item in summary["top_pred_action_tokens"]:
         print(
-            f"  sample_index={record['sample_index']} tokens={record['predicted_action_tokens']} "
-            f"final_point={final_point}"
+            f"  token_id={item['token_id']} count={item['count']} "
+            f"frequency={item['frequency']:.4f}"
         )
+    if per_scene_summary:
+        print("[analysis] per_scene_summary=")
+        for item in per_scene_summary[:5]:
+            print(
+                f"  scene={item['scene_name']} sample_count={item['sample_count']} "
+                f"token_accuracy={item['token_accuracy_overall']:.4f}"
+            )
+    _print_example_mismatches(sample_records)
     print(f"[analysis] summary_json={output_json}")
 
 

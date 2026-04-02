@@ -82,7 +82,7 @@
 - `UnifiedDrivingSample` 是当前最小主链路的统一样本格式
 - `ToyUnifiedDriveDataset` 是合成 toy 数据，只用于跑通主流程
 - `NuScenesUnifiedDriveDataset` 是最小适配器，不是 benchmark 级官方评测管线
-  当前实现使用 `CAM_FRONT`、ego pose 近似动作目标，以及“当前 BEV + future action”的简化 future BEV rollout
+  当前实现使用 `CAM_FRONT`、ego pose 近似动作目标，以及“真实 future sample annotation -> anchor_ego 坐标系 raster” 的 future BEV supervision
 - planner 的 scorer 默认是启发式规则，不是 learned scorer
 - future BEV 离散化是最小实现，不是高保真世界模型
 - selective mask 在 `generate(...)` 路径可能退化为近似实现
@@ -106,14 +106,19 @@ WorldVLA/UniTok-Drive-Lite/
 ├── requirements.txt
 ├── scripts/
 │   ├── train_minimal.py
-│   └── run_demo.py
+│   ├── run_demo.py
+│   ├── validate_overfit_minimal.py
+│   ├── analyze_action_distribution.py
+│   └── inspect_nuscenes_sample.py
 ├── unitok_drive_lite/
 │   ├── __init__.py
 │   ├── config.py
 │   ├── data.py
 │   ├── discretizer.py
+│   ├── eval_utils.py
 │   ├── masking.py
 │   ├── model.py
+│   ├── nuscenes_adapter.py
 │   ├── token_registry.py
 │   └── train_utils.py
 ├── train/
@@ -249,9 +254,18 @@ python3 scripts/validate_overfit_minimal.py \
   --num_epochs 3
 ```
 
+`validate_overfit_minimal.py` 会输出：
+
+- epoch 平均 loss
+- GT / Pred action token
+- exact sequence match 与每个时间位置的 token correctness
+- quantized / raw trajectory 误差
+- GT / Pred future BEV 差异统计
+- 可选 `.pt` 调试产物（`--save_debug_artifacts`）
+
 ### 4. Action 分布分析
 
-用于检查 greedy rollout 的 action token 是否塌缩到极少数 id：
+用于检查 greedy rollout 的 action token 是否塌缩到极少数 id，并直接给出 GT-vs-Pred 对比：
 
 ```bash
 python3 scripts/analyze_action_distribution.py \
@@ -277,7 +291,29 @@ python3 scripts/analyze_action_distribution.py \
   --output_json outputs/unitok_drive_lite/nuscenes_action_distribution.json
 ```
 
-### 5. 两阶段 planner mock demo
+`analyze_action_distribution.py` 会输出：
+
+- GT / Pred token entropy
+- overall / per-position token accuracy
+- exact sequence match ratio
+- quantized / raw trajectory 平均误差
+- per-scene sample 数与 token accuracy
+- 每个评估样本的 GT / Pred 详细记录
+
+### 5. 检查单个 nuScenes 样本
+
+训练前可以先检查一个样本的 metadata、动作统计和 future BEV 来源：
+
+```bash
+python3 scripts/inspect_nuscenes_sample.py \
+  --nuscenes_root /path/to/nuscenes \
+  --nuscenes_version v1.0-mini \
+  --nuscenes_split mini_train \
+  --sample_index 0 \
+  --max_samples 8
+```
+
+### 6. 两阶段 planner mock demo
 
 不依赖真实 Emu3 权重，可直接跑通 "动作候选 -> future BEV rollout -> 打分 -> 轨迹解码"：
 
@@ -285,7 +321,7 @@ python3 scripts/analyze_action_distribution.py \
 python3 infer/planner.py
 ```
 
-### 6. 自定义 SFT 训练脚本
+### 7. 自定义 SFT 训练脚本
 
 如果你已经有自己的样本文件，可以使用顶层实验目录中的手写训练循环版本：
 

@@ -11,7 +11,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from .config import TokenConfig
-from .data import UnifiedDrivingSample, rollout_future_bevs_from_actions
+from .data import UnifiedDrivingSample
+from .eval_utils import bev_occupancy_stats
 
 
 @dataclass(frozen=True)
@@ -204,13 +205,24 @@ class NuScenesUnifiedDriveDataset(Dataset):
         self.pose_cache[sample_token] = pose
         return pose
 
-    def _world_to_ego_xy(self, delta_xy: torch.Tensor, yaw: float) -> torch.Tensor:
-        """把世界坐标系位移投影到当前 ego 坐标系。"""
+    def _transform_world_delta_to_ego_xy(self, delta_xy: torch.Tensor, yaw: float) -> torch.Tensor:
+        """把世界坐标系位移投影到目标 ego 坐标系。"""
         cos_yaw = math.cos(yaw)
         sin_yaw = math.sin(yaw)
         forward = cos_yaw * delta_xy[0] + sin_yaw * delta_xy[1]
         lateral = -sin_yaw * delta_xy[0] + cos_yaw * delta_xy[1]
         return torch.tensor([forward, lateral], dtype=torch.float32)
+
+    def _transform_global_xy_to_anchor_ego(self, global_xy: torch.Tensor, anchor_pose: EgoPose2D) -> torch.Tensor:
+        """把全局坐标点转换到 anchor sample 的 ego 坐标系。
+
+        所有 nuScenes future BEV target 都统一在 anchor sample 的坐标系下栅格化。
+        这样当前帧与未来帧可以直接对齐，避免 future supervision 退化成简单的 `torch.roll(...)`。
+        """
+        return self._transform_world_delta_to_ego_xy(
+            global_xy - anchor_pose.translation_xy,
+            anchor_pose.yaw,
+        )
 
     def _scale_motion_to_action(self, ego_delta_xy: torch.Tensor) -> torch.Tensor:
         """把米制位移缩放到当前 unified-token 原型的动作范围。"""
@@ -238,7 +250,7 @@ class NuScenesUnifiedDriveDataset(Dataset):
             prev_pose = self._get_pose_for_sample(prev_token)
             current_pose = self._get_pose_for_sample(current_token)
             world_delta = current_pose.translation_xy - prev_pose.translation_xy
-            ego_delta = self._world_to_ego_xy(world_delta, prev_pose.yaw)
+            ego_delta = self._transform_world_delta_to_ego_xy(world_delta, prev_pose.yaw)
             reversed_actions.append(self._scale_motion_to_action(ego_delta))
             current_token = prev_token
 
@@ -260,7 +272,7 @@ class NuScenesUnifiedDriveDataset(Dataset):
             current_pose = self._get_pose_for_sample(current_token)
             next_pose = self._get_pose_for_sample(next_token)
             world_delta = next_pose.translation_xy - current_pose.translation_xy
-            ego_delta = self._world_to_ego_xy(world_delta, current_pose.yaw)
+            ego_delta = self._transform_world_delta_to_ego_xy(world_delta, current_pose.yaw)
             actions.append(self._scale_motion_to_action(ego_delta))
             current_token = next_token
 
@@ -317,38 +329,187 @@ class NuScenesUnifiedDriveDataset(Dataset):
             torch.full((1, row_end - row_start, col_end - col_start), value, dtype=bev.dtype),
         )
 
-    def _build_bev_now(self, sample_record: Dict[str, Any], ego_pose: EgoPose2D) -> torch.Tensor:
-        """构造一张最小、确定性的当前 BEV。
-
-        这里不追求 benchmark 级高保真，只把 ego 和当前 sample 的标注框粗略栅格化到
-        固定尺寸 BEV 中，保证主链路的 shape 和语义稳定。
-        """
+    def _build_bev_for_sample(
+        self,
+        target_sample_record: Dict[str, Any],
+        anchor_pose: EgoPose2D,
+        target_pose: EgoPose2D,
+        *,
+        anchor_sample_token: str,
+        target_sample_token: str,
+    ) -> tuple[torch.Tensor, Dict[str, Any]]:
+        """把任意 sample 的 annotation 栅格化到 anchor sample 的 ego 坐标系下。"""
         height, width = self.token_config.bev_size
         bev = torch.zeros((1, height, width), dtype=torch.float32)
 
-        ego_pixel = self._meters_to_grid(forward=0.0, lateral=0.0)
+        target_ego_xy = self._transform_global_xy_to_anchor_ego(
+            target_pose.translation_xy,
+            anchor_pose,
+        )
+        ego_pixel = self._meters_to_grid(
+            forward=float(target_ego_xy[0].item()),
+            lateral=float(target_ego_xy[1].item()),
+        )
         if ego_pixel is not None:
             self._paint_rect(bev, ego_pixel[0], ego_pixel[1], half_row=1, half_col=1, value=1.0)
 
         meters_per_row = (self.forward_extent_m + self.backward_extent_m) / max(height, 1)
         meters_per_col = (2.0 * self.side_extent_m) / max(width, 1)
-        for annotation_token in sample_record["anns"]:
+        annotation_count_total = 0
+        annotation_count_in_bounds = 0
+        for annotation_token in target_sample_record["anns"]:
+            annotation_count_total += 1
             annotation = self.nusc.get("sample_annotation", annotation_token)
             world_xy = torch.tensor(annotation["translation"][:2], dtype=torch.float32)
-            local_xy = self._world_to_ego_xy(world_xy - ego_pose.translation_xy, ego_pose.yaw)
+            local_xy = self._transform_global_xy_to_anchor_ego(world_xy, anchor_pose)
             pixel = self._meters_to_grid(
                 forward=float(local_xy[0].item()),
                 lateral=float(local_xy[1].item()),
             )
             if pixel is None:
                 continue
+            annotation_count_in_bounds += 1
 
             box_width_m, box_length_m = annotation["size"][:2]
             half_row = max(1, int(round((box_length_m / 2.0) / max(meters_per_row, 1e-6))))
             half_col = max(1, int(round((box_width_m / 2.0) / max(meters_per_col, 1e-6))))
             self._paint_rect(bev, pixel[0], pixel[1], half_row=half_row, half_col=half_col, value=0.7)
 
-        return bev.clamp(0.0, 1.0)
+        bev = bev.clamp(0.0, 1.0)
+        return bev, {
+            "anchor_sample_token": anchor_sample_token,
+            "target_sample_token": target_sample_token,
+            "annotation_count_total": annotation_count_total,
+            "annotation_count_in_bounds": annotation_count_in_bounds,
+            "target_ego_anchor_xy": target_ego_xy.tolist(),
+            "occupancy_stats": bev_occupancy_stats(bev),
+        }
+
+    def _build_bev_now(
+        self,
+        sample_record: Dict[str, Any],
+        ego_pose: EgoPose2D,
+        sample_token: str,
+    ) -> tuple[torch.Tensor, Dict[str, Any]]:
+        """构造当前 anchor sample 的 BEV。"""
+        return self._build_bev_for_sample(
+            target_sample_record=sample_record,
+            anchor_pose=ego_pose,
+            target_pose=ego_pose,
+            anchor_sample_token=sample_token,
+            target_sample_token=sample_token,
+        )
+
+    def _collect_future_sample_tokens(
+        self,
+        anchor_sample_token: str,
+        horizon: int,
+    ) -> tuple[List[str], List[int], List[bool]]:
+        """收集 future horizon 对应的 sample token，不足时重复最后一个可用 future sample。"""
+        future_tokens: List[str] = []
+        future_timestamps: List[int] = []
+        padding_flags: List[bool] = []
+        current_token = anchor_sample_token
+        last_valid_future_token: str | None = None
+
+        for _ in range(horizon):
+            current_sample = self._get_sample_record(current_token)
+            next_token = current_sample["next"]
+            if next_token:
+                current_token = next_token
+                last_valid_future_token = next_token
+                padding_flags.append(False)
+            else:
+                if last_valid_future_token is None:
+                    last_valid_future_token = anchor_sample_token
+                padding_flags.append(True)
+
+            future_tokens.append(last_valid_future_token)
+            future_timestamps.append(int(self._get_sample_record(last_valid_future_token)["timestamp"]))
+
+        return future_tokens, future_timestamps, padding_flags
+
+    def _build_future_bevs_from_future_samples(
+        self,
+        *,
+        anchor_sample_token: str,
+        anchor_pose: EgoPose2D,
+        bev_now: torch.Tensor,
+    ) -> tuple[torch.Tensor, Dict[str, Any]]:
+        """从真实 future sample annotation 构造未来 BEV supervision。"""
+        future_sample_tokens, future_timestamps, padding_flags = self._collect_future_sample_tokens(
+            anchor_sample_token,
+            self.token_config.future_bev_frames,
+        )
+
+        frames: List[torch.Tensor] = []
+        frame_stats: List[Dict[str, Any]] = []
+        for future_sample_token in future_sample_tokens:
+            future_sample_record = self._get_sample_record(future_sample_token)
+            future_pose = self._get_pose_for_sample(future_sample_token)
+            frame, stats = self._build_bev_for_sample(
+                target_sample_record=future_sample_record,
+                anchor_pose=anchor_pose,
+                target_pose=future_pose,
+                anchor_sample_token=anchor_sample_token,
+                target_sample_token=future_sample_token,
+            )
+            frames.append(frame)
+            frame_stats.append(stats)
+
+        future_bevs = torch.stack(frames, dim=0)
+        future_info = {
+            "future_bev_source": "nuscenes_annotations",
+            "anchor_sample_token": anchor_sample_token,
+            "future_sample_tokens": future_sample_tokens,
+            "future_timestamps": future_timestamps,
+            "coordinate_frame": "anchor_ego",
+            "future_bev_padding_flags": padding_flags,
+            "future_bev_padding_mode": "repeat_last_valid_frame",
+            "future_bev_frame_stats": frame_stats,
+        }
+        self._validate_future_bevs(bev_now=bev_now, future_bevs=future_bevs, future_info=future_info)
+        return future_bevs, future_info
+
+    def _validate_future_bevs(
+        self,
+        *,
+        bev_now: torch.Tensor,
+        future_bevs: torch.Tensor,
+        future_info: Dict[str, Any],
+    ) -> None:
+        """对 future BEV supervision 做轻量调试校验。"""
+        expected_shape = (
+            self.token_config.future_bev_frames,
+            1,
+            self.token_config.bev_size[0],
+            self.token_config.bev_size[1],
+        )
+        if tuple(future_bevs.shape) != expected_shape:
+            raise ValueError(
+                f"future_bevs shape 不正确: got={tuple(future_bevs.shape)} expected={expected_shape}"
+            )
+        if not torch.isfinite(future_bevs).all():
+            raise ValueError("future_bevs 中包含非有限值。")
+
+        frame_stats: List[Dict[str, Any]] = future_info["future_bev_frame_stats"]
+        for frame_index, stats in enumerate(frame_stats):
+            occupancy_sum = float(stats["occupancy_stats"]["sum"])
+            if stats["annotation_count_in_bounds"] > 0 and occupancy_sum <= 0.0:
+                raise ValueError(
+                    "future BEV occupancy 为空，但当前帧存在可栅格化 annotation: "
+                    f"frame_index={frame_index} target_sample_token={stats['target_sample_token']}"
+                )
+
+        padding_flags: List[bool] = future_info["future_bev_padding_flags"]
+        has_real_future_frame = any(not flag for flag in padding_flags)
+        if has_real_future_frame:
+            all_identical_to_current = all(torch.allclose(frame, bev_now) for frame in future_bevs)
+            if all_identical_to_current:
+                raise ValueError(
+                    "检测到所有 future BEV 都与当前 bev_now 完全一致，"
+                    "这通常意味着 future supervision 仍在退化成占位图。"
+                )
 
     def _build_navigation_text(
         self,
@@ -385,13 +546,17 @@ class NuScenesUnifiedDriveDataset(Dataset):
         ego_pose = self._get_pose_for_sample(descriptor.sample_token)
 
         front_image = self._load_front_image(sample_record)
-        bev_now = self._build_bev_now(sample_record, ego_pose)
+        bev_now, current_bev_stats = self._build_bev_now(
+            sample_record=sample_record,
+            ego_pose=ego_pose,
+            sample_token=descriptor.sample_token,
+        )
         history_actions = self._build_history_actions(descriptor.sample_token)
         future_actions = self._build_future_actions(descriptor.sample_token)
-        future_bevs = rollout_future_bevs_from_actions(
+        future_bevs, future_bev_info = self._build_future_bevs_from_future_samples(
+            anchor_sample_token=descriptor.sample_token,
+            anchor_pose=ego_pose,
             bev_now=bev_now,
-            future_actions=future_actions,
-            token_config=self.token_config,
         )
         navigation_text = self._build_navigation_text(scene_record, sample_record)
 
@@ -408,11 +573,22 @@ class NuScenesUnifiedDriveDataset(Dataset):
                 "adapter": "NuScenesUnifiedDriveDataset",
                 "version": self.version,
                 "split": self.split,
+                "coordinate_frame": "anchor_ego",
                 "scene_token": descriptor.scene_token,
                 "scene_name": descriptor.scene_name,
                 "sample_token": descriptor.sample_token,
                 "timestamp": sample_record["timestamp"],
+                "anchor_sample_token": descriptor.sample_token,
+                "anchor_timestamp": sample_record["timestamp"],
                 "motion_normalization_m": self.motion_normalization_m,
                 "focus_scene_token": self.focus_scene_token,
+                "current_bev_source": "nuscenes_annotations",
+                "current_bev_stats": current_bev_stats,
+                "future_bev_source": future_bev_info["future_bev_source"],
+                "future_sample_tokens": future_bev_info["future_sample_tokens"],
+                "future_timestamps": future_bev_info["future_timestamps"],
+                "future_bev_padding_flags": future_bev_info["future_bev_padding_flags"],
+                "future_bev_padding_mode": future_bev_info["future_bev_padding_mode"],
+                "future_bev_frame_stats": future_bev_info["future_bev_frame_stats"],
             },
         )

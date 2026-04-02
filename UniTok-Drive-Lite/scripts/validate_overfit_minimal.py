@@ -1,10 +1,4 @@
-"""最小 overfit 验证脚本。
-
-用途：
-- 在 toy 或 nuScenes 的极小子集上快速过拟合
-- 观察 loss 是否下降
-- 对比一个样本的 GT future action token 与预测 token
-"""
+"""最小 overfit 验证脚本。"""
 
 from __future__ import annotations
 
@@ -26,6 +20,12 @@ from unitok_drive_lite import (
     UnifiedDriveModel,
     build_default_config,
 )
+from unitok_drive_lite.eval_utils import (
+    future_bev_difference_summary,
+    token_match_summary,
+    trajectory_stats,
+    tensor_to_list,
+)
 from unitok_drive_lite.script_utils import add_dataset_selection_args, build_dataset_from_args
 from unitok_drive_lite.train_utils import (
     build_optimizer,
@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, default="outputs/unitok_drive_lite_overfit")
     parser.add_argument("--load_in_4bit", action="store_true")
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
+    parser.add_argument("--save_debug_artifacts", action="store_true")
     return parser.parse_args()
 
 
@@ -58,23 +59,46 @@ def _build_train_subset(dataset: Any, max_train_samples: int) -> Subset:
     return Subset(dataset, list(range(subset_size)))
 
 
-def _trajectory_stats(predicted: torch.Tensor, target: torch.Tensor) -> Dict[str, Any]:
-    """返回一组简洁的轨迹对比指标。"""
-    if predicted.shape != target.shape:
-        raise ValueError(
-            f"预测轨迹与目标轨迹 shape 不一致: predicted={tuple(predicted.shape)} target={tuple(target.shape)}"
-        )
-    difference = predicted - target
-    final_delta = predicted[-1] - target[-1]
-    return {
-        "predicted_shape": list(predicted.shape),
-        "target_shape": list(target.shape),
-        "mean_abs_error": float(difference.abs().mean().item()),
-        "max_abs_error": float(difference.abs().max().item()),
-        "final_step_l2": float(torch.linalg.vector_norm(final_delta).item()),
-        "predicted_final_point": predicted[-1].tolist(),
-        "target_final_point": target[-1].tolist(),
-    }
+def _stack_predicted_future_bevs(predicted_future_bevs: list[torch.Tensor]) -> torch.Tensor:
+    """把 rollout 返回的 future BEV 列表堆叠成 [F, 1, H, W]。"""
+    return torch.stack([frame.detach().cpu().to(torch.float32) for frame in predicted_future_bevs], dim=0)
+
+
+def _save_debug_artifacts(
+    checkpoint_dir: Path,
+    reference_sample: Any,
+    gt_action_tokens: list[int],
+    predicted_action_tokens: list[int],
+    gt_quantized_trajectory: torch.Tensor,
+    predicted_quantized_trajectory: torch.Tensor,
+    gt_raw_trajectory: torch.Tensor,
+    predicted_raw_trajectory: torch.Tensor,
+    gt_future_bevs: torch.Tensor,
+    predicted_future_bevs: torch.Tensor,
+) -> Path:
+    """把关键张量保存成单个 `.pt` 调试包。"""
+    debug_dir = checkpoint_dir / "debug_artifacts"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_path = debug_dir / "reference_sample_debug.pt"
+    torch.save(
+        {
+            "metadata": reference_sample.metadata,
+            "navigation_text": reference_sample.navigation_text,
+            "front_image": reference_sample.front_image.detach().cpu(),
+            "bev_now": reference_sample.bev_now.detach().cpu(),
+            "future_actions": reference_sample.future_actions.detach().cpu(),
+            "gt_action_tokens": gt_action_tokens,
+            "predicted_action_tokens": predicted_action_tokens,
+            "gt_quantized_trajectory": gt_quantized_trajectory.detach().cpu(),
+            "predicted_quantized_trajectory": predicted_quantized_trajectory.detach().cpu(),
+            "gt_raw_trajectory": gt_raw_trajectory.detach().cpu(),
+            "predicted_raw_trajectory": predicted_raw_trajectory.detach().cpu(),
+            "gt_future_bevs": gt_future_bevs.detach().cpu(),
+            "predicted_future_bevs": predicted_future_bevs.detach().cpu(),
+        },
+        debug_path,
+    )
+    return debug_path
 
 
 def main() -> None:
@@ -143,20 +167,22 @@ def main() -> None:
     print(f"[save] checkpoint_dir={checkpoint_dir}")
 
     reference_sample = train_dataset[0]
-    gt_action_tokens = model.discretizer.encode_future_actions(reference_sample.future_actions)
+    gt_action_tokens = [int(token_id) for token_id in model.discretizer.encode_future_actions(reference_sample.future_actions)]
     gt_quantized_trajectory = model.discretizer.decode_action_tokens_to_trajectory(gt_action_tokens)
-    raw_future_trajectory = torch.cumsum(reference_sample.future_actions, dim=0)
+    gt_raw_trajectory = torch.cumsum(reference_sample.future_actions.detach().cpu().to(torch.float32), dim=0)
+    gt_future_bevs = reference_sample.future_bevs.detach().cpu().to(torch.float32)
 
     rollout_output = greedy_rollout(model, reference_sample, device)
-    predicted_action_tokens = rollout_output["predicted_action_tokens"]
-    predicted_trajectory = rollout_output["predicted_trajectory"].detach().cpu()
-    token_match_count = sum(
-        int(predicted == target)
-        for predicted, target in zip(predicted_action_tokens, gt_action_tokens)
-    )
+    predicted_action_tokens = [int(token_id) for token_id in rollout_output["predicted_action_tokens"]]
+    predicted_quantized_trajectory = rollout_output["predicted_trajectory"].detach().cpu().to(torch.float32)
+    predicted_raw_trajectory = predicted_quantized_trajectory.clone()
+    predicted_future_bevs = _stack_predicted_future_bevs(rollout_output["predicted_future_bevs"])
 
-    quantized_stats = _trajectory_stats(predicted_trajectory, gt_quantized_trajectory)
-    raw_stats = _trajectory_stats(predicted_trajectory, raw_future_trajectory)
+    match = token_match_summary(gt_action_tokens, predicted_action_tokens)
+    quantized_stats = trajectory_stats(predicted_quantized_trajectory, gt_quantized_trajectory)
+    raw_stats = trajectory_stats(predicted_raw_trajectory, gt_raw_trajectory)
+    future_bev_stats = future_bev_difference_summary(predicted_future_bevs, gt_future_bevs)
+
     summary = {
         "dataset_type": args.dataset_type,
         "raw_dataset_size": len(full_dataset),
@@ -165,11 +191,36 @@ def main() -> None:
         "reference_metadata": reference_sample.metadata,
         "gt_action_tokens": gt_action_tokens,
         "predicted_action_tokens": predicted_action_tokens,
-        "token_match_count": token_match_count,
-        "token_match_ratio": token_match_count / max(len(gt_action_tokens), 1),
+        "token_match_count": match["token_match_count"],
+        "token_match_ratio": match["token_match_ratio"],
+        "exact_sequence_match": match["exact_sequence_match"],
+        "per_position_token_correctness": match["per_position_token_correctness"],
+        "gt_quantized_trajectory": tensor_to_list(gt_quantized_trajectory),
+        "predicted_quantized_trajectory": tensor_to_list(predicted_quantized_trajectory),
+        "gt_raw_trajectory": tensor_to_list(gt_raw_trajectory),
+        "predicted_raw_trajectory": tensor_to_list(predicted_raw_trajectory),
+        "predicted_raw_trajectory_source": "decoded_action_tokens",
         "quantized_trajectory_stats": quantized_stats,
         "raw_trajectory_stats": raw_stats,
+        "future_bev_difference_summary": future_bev_stats,
     }
+
+    debug_artifact_path: str | None = None
+    if args.save_debug_artifacts:
+        debug_path = _save_debug_artifacts(
+            checkpoint_dir=checkpoint_dir,
+            reference_sample=reference_sample,
+            gt_action_tokens=gt_action_tokens,
+            predicted_action_tokens=predicted_action_tokens,
+            gt_quantized_trajectory=gt_quantized_trajectory,
+            predicted_quantized_trajectory=predicted_quantized_trajectory,
+            gt_raw_trajectory=gt_raw_trajectory,
+            predicted_raw_trajectory=predicted_raw_trajectory,
+            gt_future_bevs=gt_future_bevs,
+            predicted_future_bevs=predicted_future_bevs,
+        )
+        debug_artifact_path = str(debug_path)
+        summary["debug_artifact_path"] = debug_artifact_path
 
     summary_path = checkpoint_dir / "overfit_summary.json"
     with summary_path.open("w", encoding="utf-8") as file:
@@ -178,11 +229,16 @@ def main() -> None:
     print("[report] gt_action_tokens=", gt_action_tokens)
     print("[report] predicted_action_tokens=", predicted_action_tokens)
     print(
-        f"[report] token_match_count={token_match_count} "
-        f"token_match_ratio={summary['token_match_ratio']:.3f}"
+        f"[report] token_match_count={match['token_match_count']} "
+        f"token_match_ratio={match['token_match_ratio']:.3f} "
+        f"exact_sequence_match={match['exact_sequence_match']}"
     )
+    print("[report] per_position_token_correctness=", match["per_position_token_correctness"])
     print("[report] quantized_trajectory_stats=", quantized_stats)
     print("[report] raw_trajectory_stats=", raw_stats)
+    print("[report] future_bev_difference_summary=", future_bev_stats)
+    if debug_artifact_path is not None:
+        print(f"[report] debug_artifact_path={debug_artifact_path}")
     print(f"[report] summary_json={summary_path}")
 
 
