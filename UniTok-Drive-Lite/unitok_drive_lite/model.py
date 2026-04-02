@@ -86,6 +86,48 @@ def _is_attention_mask_compatibility_error(error: Exception) -> bool:
     return "attention_mask" in message or "4d" in message or "mask" in message
 
 
+def _extract_linear_vocab_size(module: Any) -> int | None:
+    """从可能的 lm_head / output head 模块中提取输出词表大小。"""
+    weight = getattr(module, "weight", None)
+    if weight is not None and hasattr(weight, "shape") and len(weight.shape) >= 1:
+        return int(weight.shape[0])
+    out_features = getattr(module, "out_features", None)
+    if out_features is not None:
+        return int(out_features)
+    return None
+
+
+def _resize_linear_output_head(module: nn.Module, new_vocab_size: int) -> nn.Module:
+    """扩展线性输出头到新的词表大小，并保留旧权重。"""
+    if not isinstance(module, nn.Linear):
+        raise TypeError(f"暂不支持为 {type(module)} 自动扩展 lm_head。")
+
+    old_vocab_size = int(module.weight.shape[0])
+    if old_vocab_size == new_vocab_size:
+        return module
+
+    new_head = nn.Linear(
+        module.in_features,
+        new_vocab_size,
+        bias=module.bias is not None,
+        device=module.weight.device,
+        dtype=module.weight.dtype,
+    )
+    with torch.no_grad():
+        new_head.weight[:old_vocab_size].copy_(module.weight)
+        if new_vocab_size > old_vocab_size:
+            nn.init.normal_(
+                new_head.weight[old_vocab_size:],
+                mean=float(module.weight.mean().item()),
+                std=float(module.weight.std().item()) if module.weight.numel() > 1 else 0.02,
+            )
+        if module.bias is not None and new_head.bias is not None:
+            new_head.bias[:old_vocab_size].copy_(module.bias)
+            if new_vocab_size > old_vocab_size:
+                new_head.bias[old_vocab_size:].zero_()
+    return new_head
+
+
 class UnifiedDriveModel(nn.Module):
     """最小版 unified-token 自动驾驶模型包装器。"""
 
@@ -179,6 +221,10 @@ class UnifiedDriveModel(nn.Module):
 
     def get_lm_head_vocab_size(self) -> int | None:
         """返回 lm_head 词表大小；如果没有暴露输出 embedding，则返回 None。"""
+        direct_lm_head = getattr(self.backbone, "lm_head", None)
+        direct_lm_head_vocab = _extract_linear_vocab_size(direct_lm_head)
+        if direct_lm_head_vocab is not None:
+            return direct_lm_head_vocab
         output_embeddings = self.backbone.get_output_embeddings()
         if output_embeddings is None or getattr(output_embeddings, "weight", None) is None:
             return None
@@ -204,10 +250,13 @@ class UnifiedDriveModel(nn.Module):
             None if output_embeddings is None or getattr(output_embeddings, "weight", None) is None
             else int(output_embeddings.weight.shape[0])
         )
+        direct_lm_head = getattr(backbone, "lm_head", None)
+        direct_lm_head_vocab_size = _extract_linear_vocab_size(direct_lm_head)
         self._tokenizer_resize_debug.update(
             {
                 "input_vocab_size_before_resize": input_vocab_size,
                 "output_vocab_size_before_resize": output_vocab_size,
+                "direct_lm_head_vocab_size_before_resize": direct_lm_head_vocab_size,
             }
         )
 
@@ -217,6 +266,43 @@ class UnifiedDriveModel(nn.Module):
             backbone.resize_token_embeddings(tokenizer_vocab_size)
             if hasattr(backbone, "tie_weights"):
                 backbone.tie_weights()
+
+        direct_lm_head = getattr(backbone, "lm_head", None)
+        direct_lm_head_vocab_size = _extract_linear_vocab_size(direct_lm_head)
+        if direct_lm_head_vocab_size is not None and direct_lm_head_vocab_size != tokenizer_vocab_size:
+            resized_lm_head = _resize_linear_output_head(direct_lm_head, tokenizer_vocab_size)
+            if hasattr(backbone, "set_output_embeddings"):
+                try:
+                    backbone.set_output_embeddings(resized_lm_head)
+                except Exception:
+                    backbone.lm_head = resized_lm_head
+            else:
+                backbone.lm_head = resized_lm_head
+
+        # Emu3ForConditionalGeneration 的 forward/loss 使用 config.text_config.vocab_size
+        # 和/或 config.vocab_size；如果这里只扩 embedding 而不更新这些元数据，
+        # logits 与 loss 仍会沿用旧词表大小。
+        if hasattr(backbone, "config") and backbone.config is not None:
+            if hasattr(backbone.config, "vocab_size"):
+                backbone.config.vocab_size = tokenizer_vocab_size
+            text_config = getattr(backbone.config, "text_config", None)
+            if text_config is not None and hasattr(text_config, "vocab_size"):
+                text_config.vocab_size = tokenizer_vocab_size
+        nested_model = getattr(backbone, "model", None)
+        if nested_model is not None and hasattr(nested_model, "config") and nested_model.config is not None:
+            if hasattr(nested_model.config, "vocab_size"):
+                nested_model.config.vocab_size = tokenizer_vocab_size
+            text_config = getattr(nested_model.config, "text_config", None)
+            if text_config is not None and hasattr(text_config, "vocab_size"):
+                text_config.vocab_size = tokenizer_vocab_size
+            text_model = getattr(nested_model, "text_model", None)
+            if text_model is not None:
+                if hasattr(text_model, "vocab_size"):
+                    text_model.vocab_size = tokenizer_vocab_size
+                if hasattr(text_model, "config") and text_model.config is not None and hasattr(
+                    text_model.config, "vocab_size"
+                ):
+                    text_model.config.vocab_size = tokenizer_vocab_size
 
         input_embeddings = backbone.get_input_embeddings()
         output_embeddings = backbone.get_output_embeddings()
@@ -228,10 +314,19 @@ class UnifiedDriveModel(nn.Module):
             None if output_embeddings is None or getattr(output_embeddings, "weight", None) is None
             else int(output_embeddings.weight.shape[0])
         )
+        direct_lm_head_after = getattr(backbone, "lm_head", None)
+        direct_lm_head_vocab_size_after = _extract_linear_vocab_size(direct_lm_head_after)
         self._tokenizer_resize_debug.update(
             {
                 "input_vocab_size_after_resize": input_vocab_size_after,
                 "output_vocab_size_after_resize": output_vocab_size_after,
+                "direct_lm_head_vocab_size_after_resize": direct_lm_head_vocab_size_after,
+                "config_vocab_size_after_resize": getattr(getattr(backbone, "config", None), "vocab_size", None),
+                "config_text_vocab_size_after_resize": getattr(
+                    getattr(getattr(backbone, "config", None), "text_config", None),
+                    "vocab_size",
+                    None,
+                ),
             }
         )
 
@@ -244,6 +339,11 @@ class UnifiedDriveModel(nn.Module):
             raise RuntimeError(
                 "resize_token_embeddings 后 lm_head 词表仍与 tokenizer 不一致: "
                 f"tokenizer={tokenizer_vocab_size} lm_head_vocab={output_vocab_size_after}"
+            )
+        if direct_lm_head_vocab_size_after is not None and direct_lm_head_vocab_size_after != tokenizer_vocab_size:
+            raise RuntimeError(
+                "显式 lm_head 扩词后仍与 tokenizer 不一致: "
+                f"tokenizer={tokenizer_vocab_size} lm_head_vocab={direct_lm_head_vocab_size_after}"
             )
 
     def _format_token_from_id(self, token_id: int) -> str:
